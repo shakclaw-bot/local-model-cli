@@ -1,8 +1,15 @@
 # local-model
 
-A CLI tool for managing local LLM inference servers. Register GGUF models, start/stop servers, run benchmarks and quality tests — all from one command.
+A CLI tool for managing local LLM inference servers. Register GGUF models, start/stop servers, edit their settings, run speed benchmarks and accuracy evals — all from one command.
 
-Works with any llama.cpp-compatible server binary (upstream llama.cpp, [PrismML](https://github.com/nicebread-cloud/prism-ml), [TurboQuant+](https://github.com/TheTom/turboquant_plus), etc.).
+Works with any llama.cpp-compatible server binary (upstream llama.cpp, [PrismML](https://github.com/nicebread-cloud/prism-ml), [TurboQuant+](https://github.com/TheTom/turboquant_plus), etc.) on **macOS, Linux, and Windows**.
+
+Highlights:
+- **Cross-platform process management** — correct liveness checks and termination on Windows (no more accidentally killing your server on a status check) as well as POSIX.
+- **VRAM-aware `-ncmoe` auto-sizing** for MoE models — picks how many expert layers to keep on the GPU based on free VRAM at launch.
+- **Modern benchmarking** — streaming TTFT, decode tok/s percentiles, cold-prefill measurement.
+- **Accuracy evals** — GSM8K reasoning (auto-scored, pulled live from Hugging Face) plus needle-in-haystack retrieval.
+- **`edit` command** — change a model's name, port, context, runtime args, or key without hand-editing JSON.
 
 ## Install
 
@@ -59,7 +66,17 @@ This downloads the GGUF from Hugging Face into `~/.local-model/models/` and regi
 
 ### 4. Tune the model settings (optional)
 
-Edit `~/.local-model/registry.json` to set context window and KV cache:
+Use `local-model edit` instead of hand-editing JSON:
+
+```bash
+local-model edit bonsai --context 65536 --threads 8 \
+  --description "PrismML Q2_0 ternary. 2.18GB for 8B params."
+
+# inspect the full config any time (no flags = inspector mode)
+local-model edit bonsai
+```
+
+This writes to `~/.local-model/registry.json`, which you can still edit by hand if you prefer:
 
 ```json
 {
@@ -93,11 +110,21 @@ curl http://127.0.0.1:8080/v1/chat/completions \
   -d '{"model":"bonsai","messages":[{"role":"user","content":"Hello!"}]}'
 ```
 
-### 6. Benchmark
+### 6. Benchmark and evaluate
 
 ```bash
-local-model test bonsai    # Quality tests (reasoning, coding, factual, creative)
-local-model bench bonsai   # Speed benchmark at multiple context sizes
+local-model bench bonsai   # Speed: TTFT + decode tok/s (p50/p90) at a few context lengths
+local-model eval bonsai    # Accuracy: GSM8K reasoning + needle retrieval (auto-scored)
+local-model test bonsai    # Quick quality smoke test (reasoning, coding, factual, creative)
+```
+
+Example `bench` output:
+
+```
+ context   prompt   TTFT p50   TTFT p90   decode p50   decode p90   prefill
+     512      434      0.45s      0.47s         48.7         49.0      1094
+    8192     7187      4.96s      4.99s         44.1         44.7      1482
+   32768    29155     19.84s     19.84s         35.9         36.0      1484
 ```
 
 ## Commands
@@ -108,11 +135,13 @@ local-model bench bonsai   # Speed benchmark at multiple context sizes
 | `local-model start <model> [--ctx N]` | Start a model server |
 | `local-model stop <model\|all>` | Stop running server(s) |
 | `local-model status` | Show running servers with health and slot info |
-| `local-model test <model>` | Run quality tests (reasoning, coding, factual, creative, needle-in-haystack) |
-| `local-model bench <model>` | Speed benchmark at 512 / 2K / 8K / 32K / 64K context |
+| `local-model edit <model> [flags]` | Edit settings (name, port, context, runtime args, `--rename-key`); no flags = inspector |
+| `local-model bench <model> [--ctx N] [--iters N]` | Speed benchmark: streaming TTFT + decode tok/s (p50/p90) |
+| `local-model eval <model> [--questions N]` | Accuracy eval: GSM8K reasoning + needle retrieval (auto-scored) |
+| `local-model test <model> [--prompts N]` | Quick quality smoke test (reasoning, coding, factual, creative) |
 | `local-model add <path\|hf:repo> [name]` | Register a GGUF model (local file or Hugging Face) |
 | `local-model info <model>` | Show model details, file size, GGUF metadata |
-| `local-model config` | Show configuration (home dir, backends, platform) |
+| `local-model config [--set-backend N PATH]` | Show / edit configuration (home dir, backends, platform) |
 
 ## Configuration
 
@@ -122,8 +151,9 @@ All state lives in `~/.local-model/` (override with `LOCAL_MODEL_HOME` env var):
 ~/.local-model/
 ├── config.json      # Backend paths and defaults
 ├── registry.json    # Registered models
-├── models/          # GGUF files (downloaded or symlinked)
-└── logs/            # Server logs, PID files, benchmark results
+├── models/          # GGUF files (downloaded, symlinked, or referenced by absolute path)
+├── datasets/        # Cached eval datasets (e.g. GSM8K)
+└── logs/            # Server logs, PID files, benchmark/eval results
 ```
 
 ### Backends
@@ -157,11 +187,97 @@ If no backend is configured, `local-model` looks for `llama-server` on your `PAT
 | `context` | `8192` | Context window size |
 | `cache_k` | `"f16"` | KV cache key type (`f16`, `q8_0`, `q4_0`) |
 | `cache_v` | `"f16"` | KV cache value type (`f16`, `q8_0`, `turbo4`) |
-| `flash_attn` | `"on"` | Flash attention (`on` / `off`) |
+| `flash_attn` | `"on"` | Flash attention (`on` / `off` / `auto`) |
 | `gpu_layers` | `99` | GPU layers to offload (`0` for CPU-only) |
 | `threads` | `4` | CPU threads |
 | `mmproj` | — | Vision multimodal projector GGUF file |
-| `server_args` | `[]` | Extra args passed to llama-server |
+| `server_args` | `[]` | Extra args passed to llama-server (e.g. `--no-mmap`, `--jinja`, `--chat-template-file`) |
+| `auto_ncmoe` | — | VRAM-aware `-ncmoe` auto-sizing for MoE models (object — see below) |
+| `notes` | — | Free-text description (shown by `info` / `edit`) |
+
+## Editing models
+
+`local-model edit` changes registry settings without hand-editing JSON:
+
+```bash
+# common fields
+local-model edit bonsai --name "Ternary Bonsai 8B" --description "..." \
+  --port 8090 --context 65536 --threads 8 --flash-attn on
+
+# runtime / KV cache
+local-model edit gemma4 --cache-k turbo3 --cache-v turbo3 --gpu-layers 99 \
+  --server-args "--no-mmap --jinja --chat-template-file /path/to/template.jinja"
+
+# arbitrary field with auto-typed value (int / float / bool / null / JSON)
+local-model edit gemma4 --set threads=12
+local-model edit gemma4 --set auto_ncmoe='{"safety_margin_mb":1500}'
+
+# rename the key used in commands (moves the registry entry + pid/log/result files)
+local-model edit qwen --rename-key qwen3.6-35b
+
+# no flags = inspector: prints the full current config
+local-model edit gemma4
+```
+
+`--server-args` replaces the existing list and is parsed with shell-style quoting. Editing a running model warns you that changes take effect on next start.
+
+## VRAM auto-sizing for MoE models (`auto_ncmoe`)
+
+For Mixture-of-Experts models you can offload expert layers to CPU with llama.cpp's `-ncmoe`. Rather than hard-coding a value, add an `auto_ncmoe` block and the CLI queries free VRAM via `nvidia-smi` at start time and computes how many expert layers fit on the GPU:
+
+```json
+{
+  "qwen3.6-35b": {
+    "file": "Qwen3.6-35B-A3B-UD-IQ3_XXS.gguf",
+    "context": 262144,
+    "cache_k": "turbo3",
+    "cache_v": "turbo3",
+    "auto_ncmoe": {
+      "total_layers": 40,
+      "per_layer_expert_mb": 310,
+      "base_gpu_mb": 900,
+      "compute_buffer_mb": 800,
+      "rs_buffer_mb": 63,
+      "kv_mb_at_128k": 500,
+      "safety_margin_mb": 1024
+    },
+    "server_args": ["--no-mmap", "--jinja", "--chat-template-file", "/path/chat_template.jinja"]
+  }
+}
+```
+
+At start you'll see, e.g.:
+
+```
+  auto-ncmoe: 9770 MiB free, ctx=262144 -> 19/40 expert layers on GPU, ncmoe=21
+```
+
+The constants are empirical — measure them from a model's startup log (`CPU_Mapped`/`CUDA0 model buffer size`, `KV buffer size`, `RS buffer size`, `compute buffer size`). If `nvidia-smi` is unavailable, auto-sizing is skipped and you can set a static `-ncmoe` in `server_args` instead.
+
+## Benchmarking & evaluation
+
+**`bench`** measures speed with modern metrics: client-side **TTFT** (time to first token) via streaming, **decode tok/s** reported as p50/p90 across iterations (1 warmup discarded), and prefill tok/s. Each measured request uses a unique prefix to bust prompt-prefix caching, so TTFT/prefill reflect a true cold prefill.
+
+```bash
+local-model bench qwen3.6-35b --iters 3      # default 3 iters/length
+```
+
+**`eval`** measures accuracy:
+- **GSM8K** grade-school math reasoning, pulled live from the Hugging Face datasets-server (no `datasets` dependency) and cached under `~/.local-model/datasets/`. Answers are auto-scored by exact numeric match.
+- **Needle-in-haystack** retrieval at a couple of context lengths, auto-scored PASS/FAIL.
+
+```bash
+local-model eval qwen3.6-35b --questions 20   # default 20 GSM8K questions
+```
+
+Results are written to `~/.local-model/logs/bench-<key>.json` and `eval-<key>.json`, and the average speeds surface in `local-model list`.
+
+## Platform support
+
+Tested on macOS, Linux, and Windows. Windows specifics handled by the CLI:
+- Liveness checks use `OpenProcess`/`GetExitCodeProcess` (a naive `os.kill(pid, 0)` would *terminate* the process on Windows).
+- Process termination uses `taskkill /T /F` (reaps child processes); POSIX uses `SIGTERM`.
+- `add` falls back to registering an absolute path when symlink creation isn't permitted (Windows without admin/Developer Mode).
 
 ## CPU-Only Setup (no GPU)
 
