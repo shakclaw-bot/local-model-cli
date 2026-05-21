@@ -261,7 +261,7 @@ def _query_free_vram_mb():
         return None
 
 
-def _compute_ncmoe(cfg, ctx):
+def _compute_ncmoe(cfg, ctx, quiet=False):
     """VRAM-aware -ncmoe (ported from run-qwen.ps1).
 
     Active only when the model config has an "auto_ncmoe" block. Computes how
@@ -276,8 +276,9 @@ def _compute_ncmoe(cfg, ctx):
         return None
     free_mb = _query_free_vram_mb()
     if free_mb is None:
-        print("  warning: nvidia-smi unavailable; skipping auto-ncmoe",
-              file=sys.stderr)
+        if not quiet:
+            print("  warning: nvidia-smi unavailable; skipping auto-ncmoe",
+                  file=sys.stderr)
         return None
     total   = int(auto.get("total_layers", 40))
     per     = float(auto.get("per_layer_expert_mb", 310))
@@ -291,8 +292,9 @@ def _compute_ncmoe(cfg, ctx):
     budget = free_mb - kv - rs - compute - base - safety
     layers_on_gpu = max(0, min(total, int(budget // per)))
     ncmoe = total - layers_on_gpu
-    print(f"  auto-ncmoe: {free_mb} MiB free, ctx={ctx} -> "
-          f"{layers_on_gpu}/{total} expert layers on GPU, ncmoe={ncmoe}")
+    if not quiet:
+        print(f"  auto-ncmoe: {free_mb} MiB free, ctx={ctx} -> "
+              f"{layers_on_gpu}/{total} expert layers on GPU, ncmoe={ncmoe}")
     return ncmoe
 
 
@@ -354,6 +356,8 @@ def _get_bench_speeds(key):
             data = json.loads(path.read_text())
         except Exception:
             continue
+        if isinstance(data, dict):
+            data = data.get("results", [])
         if not isinstance(data, list):
             continue
         gens = [r.get("decode_p50_tps", r.get("gen_tps", 0))
@@ -904,6 +908,93 @@ def cmd_test(args):
             print(f"\n{cfg['name']} stopped (was started for test).")
 
 
+def _gpu_info():
+    """GPU name / total VRAM / driver via nvidia-smi (empty dict if absent)."""
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name,memory.total,driver_version",
+             "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=10, check=True,
+        )
+        parts = [x.strip() for x in out.stdout.strip().splitlines()[0].split(",")]
+        if len(parts) >= 3:
+            return {"name": parts[0], "memory_total": parts[1], "driver": parts[2]}
+    except Exception:
+        pass
+    return {}
+
+
+def _engine_version(binary):
+    """Version/build line from `<binary> --version` (best effort)."""
+    if not binary or not os.path.isfile(binary):
+        return "unknown"
+    try:
+        out = subprocess.run([binary, "--version"], capture_output=True,
+                             text=True, timeout=30)
+        text = (out.stderr or "") + "\n" + (out.stdout or "")
+        ver = build = ""
+        for line in text.splitlines():
+            s = line.strip()
+            if s.lower().startswith("version:"):
+                ver = s
+            elif s.lower().startswith("build"):
+                build = s
+        return " | ".join(x for x in (ver, build) if x) or "unknown"
+    except Exception:
+        return "unknown"
+
+
+_QUANTS = ["IQ1_M", "IQ2_XXS", "IQ2_M", "IQ3_XXS", "IQ3_S", "IQ3_M",
+           "IQ4_XS", "IQ4_NL", "Q2_K", "Q3_K", "Q4_K_M", "Q4_K_S",
+           "Q5_K_M", "Q6_K", "Q8_0"]
+
+
+def _provenance(cfg, ctx):
+    """Capture engine/GPU/host/model/runtime so a result is reproducible and
+    drift across engine, driver, or model upgrades is detectable."""
+    binary = resolve_binary(cfg) or ""
+    model_path = resolve_model_path(cfg) or cfg.get("file", "")
+    size_gb = None
+    quant = None
+    try:
+        if model_path and os.path.isfile(model_path):
+            size_gb = round(os.path.getsize(model_path) / 1e9, 2)
+    except OSError:
+        pass
+    base = os.path.basename(model_path or "")
+    for q in _QUANTS:
+        if q.lower() in base.lower():
+            quant = q
+            break
+    return {
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "engine": {"binary": binary, "version": _engine_version(binary)},
+        "gpu": _gpu_info(),
+        "host": {"platform": platform.platform(), "cpu_count": os.cpu_count()},
+        "model": {"file": model_path, "quant": quant, "size_gb": size_gb},
+        "runtime": {
+            "context": ctx,
+            "cache_k": cfg.get("cache_k", "f16"),
+            "cache_v": cfg.get("cache_v", "f16"),
+            "flash_attn": cfg.get("flash_attn", "on"),
+            "gpu_layers": cfg.get("gpu_layers", 99),
+            "threads": cfg.get("threads", 4),
+            "auto_ncmoe": cfg.get("auto_ncmoe"),  # calibration inputs (actual ncmoe is non-deterministic; printed live at start)
+            "server_args": cfg.get("server_args", []),
+        },
+    }
+
+
+def _print_provenance(meta):
+    eng = meta.get("engine", {}).get("version", "?")
+    gpu = meta.get("gpu", {})
+    gpu_s = gpu.get("name", "?")
+    if gpu.get("driver"):
+        gpu_s += f" (drv {gpu['driver']})"
+    quant = meta.get("model", {}).get("quant") or "?"
+    print(f"  env: {eng}  |  {gpu_s}  |  quant {quant}")
+
+
 def cmd_bench(args):
     registry = load_registry()
     key = get_model_key(registry, args.model)
@@ -983,8 +1074,11 @@ def cmd_bench(args):
     if results:
         print(f"\nBest median decode: {max(r['decode_p50_tps'] for r in results):.1f} tok/s")
 
+    meta = _provenance(cfg, ctx_limit)
+    _print_provenance(meta)
     out = LOGS_DIR / f"bench-{key}.json"
-    out.write_text(json.dumps(results, indent=2, default=str) + "\n")
+    out.write_text(json.dumps({"meta": meta, "results": results},
+                              indent=2, default=str) + "\n")
     print(f"Results saved to {out}")
 
     if started_by_us:
@@ -1052,9 +1146,11 @@ def cmd_eval(args):
         except Exception as e:
             print(f"  ~{ctx_tokens} tok: ERROR {e}")
 
+    meta = _provenance(cfg, cfg.get("context", 8192))
+    _print_provenance(meta)
     out = LOGS_DIR / f"eval-{key}.json"
-    out.write_text(json.dumps({"gsm8k_accuracy_pct": gsm_acc, "needle": needle},
-                              indent=2, default=str) + "\n")
+    out.write_text(json.dumps({"meta": meta, "gsm8k_accuracy_pct": gsm_acc,
+                               "needle": needle}, indent=2, default=str) + "\n")
     print(f"\nResults saved to {out}")
 
     if started_by_us:
