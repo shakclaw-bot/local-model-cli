@@ -170,17 +170,71 @@ def log_file_for(key):
     return LOGS_DIR / f"{key}.log"
 
 
+def _pid_alive(pid):
+    """Cross-platform liveness check that does NOT kill the process.
+
+    On Windows, os.kill(pid, 0) calls TerminateProcess and would KILL the
+    target, so we use OpenProcess + GetExitCodeProcess instead. On POSIX,
+    signal 0 is a real liveness probe.
+    """
+    if not pid:
+        return False
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        STILL_ACTIVE = 259
+        k32 = ctypes.windll.kernel32
+        handle = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+        if not handle:
+            return False
+        try:
+            code = wintypes.DWORD()
+            if k32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                return code.value == STILL_ACTIVE
+            return False
+        finally:
+            k32.CloseHandle(handle)
+    else:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True  # exists but owned by another user
+        return True
+
+
+def _terminate_pid(pid):
+    """Cross-platform termination. llama-server is stateless (in-memory KV
+    cache, nothing to flush) so a force kill is safe. Windows: taskkill /T to
+    also reap children. POSIX: SIGTERM.
+    """
+    if not pid:
+        return
+    if os.name == "nt":
+        subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
+                       capture_output=True)
+    else:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+
+
 def get_running_pid(key):
     pf = pid_file_for(key)
     if not pf.exists():
         return None
     try:
         pid = int(pf.read_text().strip())
-        os.kill(pid, 0)
-        return pid
-    except (ValueError, ProcessLookupError, PermissionError):
+    except ValueError:
         pf.unlink(missing_ok=True)
         return None
+    if _pid_alive(pid):
+        return pid
+    pf.unlink(missing_ok=True)
+    return None
 
 
 def check_health(port, timeout=3):
@@ -193,6 +247,54 @@ def check_health(port, timeout=3):
 
 
 # ── Server Command Builder ─────────────────────────────────────────────────
+
+def _query_free_vram_mb():
+    """Free VRAM (MiB) of the first GPU via nvidia-smi, or None if unavailable."""
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.free",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=10, check=True,
+        )
+        return int(out.stdout.strip().splitlines()[0].strip())
+    except Exception:
+        return None
+
+
+def _compute_ncmoe(cfg, ctx):
+    """VRAM-aware -ncmoe (ported from run-qwen.ps1).
+
+    Active only when the model config has an "auto_ncmoe" block. Computes how
+    many MoE expert layers to keep on CPU based on free VRAM at start time, so
+    it adapts to whatever else is on the GPU. Returns int, or None to skip.
+
+    auto_ncmoe may override any calibration constant; defaults are calibrated
+    for Qwen3.6-35B-A3B IQ3_XXS + turbo3 KV on a 12 GB card.
+    """
+    auto = cfg.get("auto_ncmoe")
+    if not auto:
+        return None
+    free_mb = _query_free_vram_mb()
+    if free_mb is None:
+        print("  warning: nvidia-smi unavailable; skipping auto-ncmoe",
+              file=sys.stderr)
+        return None
+    total   = int(auto.get("total_layers", 40))
+    per     = float(auto.get("per_layer_expert_mb", 310))
+    base    = float(auto.get("base_gpu_mb", 900))
+    compute = float(auto.get("compute_buffer_mb", 800))
+    rs      = float(auto.get("rs_buffer_mb", 63))
+    kv128   = float(auto.get("kv_mb_at_128k", 500))
+    safety  = float(auto.get("safety_margin_mb", 1024))
+
+    kv = (ctx / 131072.0) * kv128
+    budget = free_mb - kv - rs - compute - base - safety
+    layers_on_gpu = max(0, min(total, int(budget // per)))
+    ncmoe = total - layers_on_gpu
+    print(f"  auto-ncmoe: {free_mb} MiB free, ctx={ctx} -> "
+          f"{layers_on_gpu}/{total} expert layers on GPU, ncmoe={ncmoe}")
+    return ncmoe
+
 
 def _build_server_cmd(cfg, binary, model_path, port, ctx):
     cmd = [
@@ -211,11 +313,16 @@ def _build_server_cmd(cfg, binary, model_path, port, ctx):
     if mmproj:
         mmproj_path = MODELS_DIR / mmproj
         if mmproj_path.exists():
-            cmd += ["-mm", str(mmproj_path)]
+            cmd += ["--mmproj", str(mmproj_path)]
         elif os.path.isfile(mmproj):
-            cmd += ["-mm", mmproj]
+            cmd += ["--mmproj", mmproj]
         else:
             print(f"  warning: mmproj not found: {mmproj}", file=sys.stderr)
+
+    # VRAM-aware -ncmoe (ported from run-qwen.ps1); only when auto_ncmoe is set.
+    ncmoe = _compute_ncmoe(cfg, ctx)
+    if ncmoe is not None:
+        cmd += ["-ncmoe", str(ncmoe)]
 
     # Pass through extra server args from config
     extra = cfg.get("server_args", [])
@@ -237,19 +344,28 @@ def _describe_config(cfg):
 # ── Bench Speeds (for dashboard) ───────────────────────────────────────────
 
 def _get_bench_speeds(key):
+    # Reads both the new bench format (decode_p50_tps / prefill_tps) and the
+    # legacy format (gen_tps / prompt_tps).
     for filename in [f"bench-{key}.json", f"test-{key}.json"]:
         path = LOGS_DIR / filename
-        if path.exists():
-            try:
-                data = json.loads(path.read_text())
-                gen_speeds = [r.get("gen_tps", 0) for r in data if isinstance(r, dict) and r.get("gen_tps", 0) > 0]
-                prompt_speeds = [r.get("prompt_tps", 0) for r in data if isinstance(r, dict) and r.get("prompt_tps", 0) > 0]
-                if gen_speeds:
-                    avg_gen = round(sum(gen_speeds) / len(gen_speeds), 1)
-                    avg_prompt = round(sum(prompt_speeds) / len(prompt_speeds), 1) if prompt_speeds else None
-                    return avg_prompt, avg_gen
-            except Exception:
-                pass
+        if not path.exists():
+            continue
+        try:
+            data = json.loads(path.read_text())
+        except Exception:
+            continue
+        if not isinstance(data, list):
+            continue
+        gens = [r.get("decode_p50_tps", r.get("gen_tps", 0))
+                for r in data if isinstance(r, dict)]
+        gens = [g for g in gens if g]
+        prompts = [r.get("prefill_tps", r.get("prompt_tps", 0))
+                   for r in data if isinstance(r, dict)]
+        prompts = [p for p in prompts if p]
+        if gens:
+            avg_gen = round(sum(gens) / len(gens), 1)
+            avg_prompt = round(sum(prompts) / len(prompts), 1) if prompts else None
+            return avg_prompt, avg_gen
     return None, None
 
 
@@ -263,8 +379,12 @@ def cmd_list(args):
         print("  local-model add hf:<huggingface-repo>")
         return
 
-    print(f"{'Model':<18} {'Name':<28} {'Port':>5} {'Context':>8} {'tok/s in':>9} {'tok/s out':>9} {'Status':<10}")
-    print("-" * 95)
+    headers = ["Model", "Name", "Port", "Context", "tok/s in", "tok/s out", "Status"]
+    # Alignment for the first 6 (padded) columns; Status is last and unpadded
+    # so its ANSI colour codes never throw off alignment.
+    aligns = ["<", "<", ">", ">", ">", ">"]
+
+    rows = []
     for key, cfg in sorted(registry.items()):
         port = cfg.get("port", "?")
         ctx = cfg.get("context", "?")
@@ -278,18 +398,33 @@ def cmd_list(args):
         out_str = f"{gen_speed:.1f}" if gen_speed else "-"
 
         pid = get_running_pid(key)
-        if pid and check_health(port):
-            status = f"\033[32mrunning\033[0m (:{port})"
-        elif pid:
-            status = f"\033[33mstarting\033[0m"
-        else:
-            status = "\033[90mstopped\033[0m"
-
         model_path = resolve_model_path(cfg)
         if not model_path:
             status = "\033[31mmissing\033[0m"
+        elif pid and check_health(port):
+            status = f"\033[32mrunning\033[0m (:{port})"
+        elif pid:
+            status = "\033[33mstarting\033[0m"
+        else:
+            status = "\033[90mstopped\033[0m"
 
-        print(f"{key:<18} {cfg.get('name', '?'):<28} {port:>5} {ctx_str:>8} {in_str:>9} {out_str:>9} {status}")
+        rows.append([key, cfg.get("name", "?"), str(port), ctx_str,
+                     in_str, out_str, status])
+
+    # Column widths sized to the content (header + every cell), 6 padded cols.
+    widths = [max(len(headers[i]), *(len(r[i]) for r in rows))
+              for i in range(len(aligns))]
+
+    def _fmt(cells):
+        parts = [f"{cells[i]:{aligns[i]}{widths[i]}}" for i in range(len(aligns))]
+        parts.append(cells[6])  # Status: last column, printed as-is
+        return "  ".join(parts)
+
+    header_line = _fmt(headers)
+    print(header_line)
+    print("-" * len(header_line))
+    for r in rows:
+        print(_fmt(r))
 
 
 def cmd_start(args):
@@ -307,7 +442,7 @@ def cmd_start(args):
 
     if pid:
         try:
-            os.kill(pid, signal.SIGTERM)
+            _terminate_pid(pid)
             time.sleep(2)
         except ProcessLookupError:
             pass
@@ -369,7 +504,7 @@ def cmd_stop(args):
         if pid:
             name = registry.get(key, {}).get("name", key)
             try:
-                os.kill(pid, signal.SIGTERM)
+                _terminate_pid(pid)
                 print(f"Stopped {name} (PID {pid})")
                 stopped += 1
             except ProcessLookupError:
@@ -435,6 +570,158 @@ def _build_haystack(target_tokens):
     return "\n\n".join(parts)[:target_chars]
 
 
+def _chat_stream(port, prompt, max_tokens=512, model_name="bench",
+                 enable_thinking=False):
+    """Streaming chat completion with client-side TTFT measurement.
+
+    Modern inference metrics: TTFT (time to first token) is timed client-side
+    from the first streamed token; prefill/decode tok/s come from the server's
+    own `timings` (authoritative), with a client-side fallback. Returns a dict
+    with content, ttft, elapsed, prompt_tokens, tokens, prefill_tps,
+    decode_tps, tpot_ms.
+    """
+    url = f"http://127.0.0.1:{port}/v1/chat/completions"
+    payload = {
+        "model": model_name,
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": max_tokens,
+        "temperature": 0,
+        "stream": True,
+        "stream_options": {"include_usage": True},
+        "chat_template_kwargs": {"enable_thinking": enable_thinking},
+    }
+    data = json.dumps(payload).encode()
+    req = urllib.request.Request(url, data=data,
+                                 headers={"Content-Type": "application/json"})
+    t0 = time.perf_counter()
+    ttft = None
+    content_parts, reasoning_parts = [], []
+    usage, timings = {}, {}
+    resp = urllib.request.urlopen(req, timeout=600)
+    for raw in resp:
+        line = raw.decode("utf-8", "replace").strip()
+        if not line.startswith("data:"):
+            continue
+        chunk = line[5:].strip()
+        if chunk == "[DONE]":
+            break
+        try:
+            obj = json.loads(chunk)
+        except json.JSONDecodeError:
+            continue
+        choices = obj.get("choices") or []
+        if choices:
+            delta = choices[0].get("delta", {})
+            c = delta.get("content") or ""
+            rc = delta.get("reasoning_content") or ""
+            if (c or rc) and ttft is None:
+                ttft = time.perf_counter() - t0
+            if c:
+                content_parts.append(c)
+            if rc:
+                reasoning_parts.append(rc)
+        if obj.get("usage"):
+            usage = obj["usage"]
+        if obj.get("timings"):
+            timings = obj["timings"]
+    elapsed = time.perf_counter() - t0
+
+    content = "".join(content_parts)
+    if not content and reasoning_parts:
+        content = "".join(reasoning_parts)
+    tokens = usage.get("completion_tokens") or usage.get("output_tokens") or 0
+    prompt_tokens = usage.get("prompt_tokens") or usage.get("input_tokens") or 0
+    prefill_tps = timings.get("prompt_per_second") or 0
+    decode_tps = timings.get("predicted_per_second") or 0
+    predicted_ms = timings.get("predicted_ms")
+
+    if not decode_tps and ttft is not None and tokens > 1 and elapsed > ttft:
+        decode_tps = (tokens - 1) / (elapsed - ttft)
+    if predicted_ms and tokens >= 1:
+        tpot_ms = predicted_ms / max(1, tokens)
+    elif ttft is not None and tokens > 1 and elapsed > ttft:
+        tpot_ms = (elapsed - ttft) * 1000.0 / (tokens - 1)
+    else:
+        tpot_ms = 0.0
+
+    return {
+        "content": content,
+        "ttft": round(ttft, 3) if ttft is not None else None,
+        "elapsed": round(elapsed, 2),
+        "prompt_tokens": prompt_tokens,
+        "tokens": tokens,
+        "prefill_tps": round(prefill_tps, 1),
+        "decode_tps": round(decode_tps, 1),
+        "tpot_ms": round(tpot_ms, 1),
+    }
+
+
+def _bench_prompt(target_tokens):
+    """Build a prompt of roughly target_tokens with a short generation task."""
+    filler = ("The history of computing spans mechanical calculators, vacuum "
+              "tubes, transistors, integrated circuits, and now accelerators "
+              "for machine learning. Each era reshaped what software could do. ")
+    target_chars = max(0, target_tokens - 40) * 4  # ~4 chars/token heuristic
+    n = max(1, target_chars // len(filler))
+    body = "\n".join(f"[{i}] {filler}" for i in range(n))
+    return body + "\nSummarize the passage above in two sentences."
+
+
+def _load_gsm8k(n):
+    """Fetch + cache n GSM8K test rows via the HF datasets-server JSON API.
+
+    No 'datasets' dependency needed - plain HTTP. Cached under ROOT/datasets.
+    """
+    cache = ROOT / "datasets" / "gsm8k_test.json"
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    rows = []
+    if cache.exists():
+        try:
+            rows = json.loads(cache.read_text())
+        except Exception:
+            rows = []
+    if len(rows) >= n:
+        return rows[:n]
+    rows = []
+    offset = 0
+    while len(rows) < n:
+        length = min(100, n - len(rows))
+        url = ("https://datasets-server.huggingface.co/rows?dataset=openai/gsm8k"
+               f"&config=main&split=test&offset={offset}&length={length}")
+        try:
+            r = urllib.request.urlopen(url, timeout=30)
+            payload = json.loads(r.read())
+        except Exception as e:
+            print(f"  failed to fetch GSM8K: {e}", file=sys.stderr)
+            break
+        batch = payload.get("rows", [])
+        if not batch:
+            break
+        rows.extend(item["row"] for item in batch)
+        offset += len(batch)
+    if rows:
+        cache.write_text(json.dumps(rows, indent=2))
+    return rows[:n]
+
+
+def _extract_final_number(text):
+    """Pull the final numeric answer from text (handles #### marker, $ and commas)."""
+    import re
+    has_marker = "####" in text
+    tail = text.split("####")[-1] if has_marker else text
+    nums = re.findall(r"-?\$?\d[\d,]*\.?\d*", tail)
+    if not nums:
+        return None
+    # After a #### marker the answer is the first number; otherwise fall back
+    # to the last number in the text.
+    pick = nums[0] if has_marker else nums[-1]
+    s = pick.replace("$", "").replace(",", "").rstrip(".")
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
 def _chat(port, prompt, max_tokens=512, model_name="test"):
     url = f"http://127.0.0.1:{port}/v1/chat/completions"
     payload = {
@@ -488,7 +775,7 @@ def _ensure_clean_for_bench(registry, target_key):
         if answer in ("", "y", "yes"):
             for k, name, pid in others_running:
                 try:
-                    os.kill(pid, signal.SIGTERM)
+                    _terminate_pid(pid)
                     print(f"  Stopped {name}")
                 except ProcessLookupError:
                     pass
@@ -520,7 +807,7 @@ def _start_for_bench(registry, key, ctx_override=None):
 
     if pid:
         try:
-            os.kill(pid, signal.SIGTERM)
+            _terminate_pid(pid)
             time.sleep(2)
         except ProcessLookupError:
             pass
@@ -610,7 +897,7 @@ def cmd_test(args):
         pid = get_running_pid(key)
         if pid:
             try:
-                os.kill(pid, signal.SIGTERM)
+                _terminate_pid(pid)
             except ProcessLookupError:
                 pass
             pid_file_for(key).unlink(missing_ok=True)
@@ -623,9 +910,8 @@ def cmd_bench(args):
     cfg = get_model(registry, args.model)
 
     _ensure_clean_for_bench(registry, key)
-
-    ctx_override = args.ctx or cfg.get("context", 8192)
-    port, started_by_us = _start_for_bench(registry, key, ctx_override)
+    ctx_cap = args.ctx or cfg.get("context", 8192)
+    port, started_by_us = _start_for_bench(registry, key, ctx_cap)
 
     actual_ctx = None
     try:
@@ -635,33 +921,67 @@ def cmd_bench(args):
             actual_ctx = slots[0].get("n_ctx")
     except Exception:
         pass
-    ctx_limit = actual_ctx or ctx_override
+    ctx_limit = actual_ctx or ctx_cap
 
-    contexts = [512, 2048, 8192, 32768, 65536]
-    contexts = [c for c in contexts if c <= ctx_limit]
+    # A couple of representative lengths (short / medium / longer), capped.
+    candidates = [512, 8192, 32768]
+    test_ctx = [c for c in candidates if c <= ctx_limit] or [min(candidates)]
+    iters = getattr(args, "iters", None) or 3
 
-    print(f"\nBenchmarking {cfg['name']} on port {port} (ctx={ctx_limit})\n")
+    def pct(xs, p):
+        xs = sorted(x for x in xs if x is not None)
+        if not xs:
+            return 0.0
+        i = min(len(xs) - 1, int(round((p / 100.0) * (len(xs) - 1))))
+        return xs[i]
 
-    filler = "The history of computing is a fascinating journey from Babbage to quantum computers. Each generation built on the last with vacuum tubes giving way to transistors then integrated circuits. Software evolved from machine code to high-level languages. Networks connected computers globally. AI and ML represent the latest frontier. "
+    print(f"\nBenchmarking {cfg['name']} on port {port} (ctx_limit={ctx_limit})")
+    print(f"  {iters} iters/length, 1 warmup discarded, streaming TTFT\n")
+    hdr = (f"{'context':>8}  {'prompt':>7}  {'TTFT p50':>9}  {'TTFT p90':>9}  "
+           f"{'decode p50':>11}  {'decode p90':>11}  {'prefill':>8}")
+    print(hdr)
+    print("-" * len(hdr))
 
+    import uuid
     results = []
-    for target_tokens in contexts:
-        fill_target = int(target_tokens * 0.6)
-        n_repeats = max(1, fill_target // 80)
-        text = "\n".join([f"[{i}] {filler}" for i in range(n_repeats)])
-        text += "\nSummarize the above in 2 sentences."
-
-        label = f"~{target_tokens} tok"
+    for target in test_ctx:
+        base = _bench_prompt(target)
+        # Unique prefix per request busts llama.cpp prompt-prefix caching so
+        # every measured request pays a true (cold) prefill -> honest TTFT.
+        def _fresh():
+            return f"[run {uuid.uuid4().hex[:8]}] {base}"
         try:
-            r = _chat(port, text, max_tokens=128)
-            print(f"  {label:<12} prompt={r['prompt_tokens']:>6} tok  prompt_speed={r['prompt_tps']:>6.1f} tok/s  gen={r['gen_tps']:>5.1f} tok/s  wall={r['elapsed']:.1f}s")
-            results.append({"context": target_tokens, **r})
-        except Exception as e:
-            print(f"  {label:<12} ERROR: {e}")
+            _chat_stream(port, _fresh(), max_tokens=128)  # warmup (discarded)
+        except Exception:
+            pass
+        samples = []
+        for _ in range(iters):
+            try:
+                samples.append(_chat_stream(port, _fresh(), max_tokens=128))
+            except Exception as e:
+                print(f"{target:>8}  ERROR: {e}")
+        if not samples:
+            continue
+        ttfts = [s["ttft"] for s in samples]
+        decodes = [s["decode_tps"] for s in samples]
+        prefills = [s["prefill_tps"] for s in samples if s["prefill_tps"]]
+        ptoks = samples[0]["prompt_tokens"]
+        row = {
+            "context": target,
+            "prompt_tokens": ptoks,
+            "ttft_p50_s": round(pct(ttfts, 50), 2),
+            "ttft_p90_s": round(pct(ttfts, 90), 2),
+            "decode_p50_tps": round(pct(decodes, 50), 1),
+            "decode_p90_tps": round(pct(decodes, 90), 1),
+            "prefill_tps": round(sum(prefills) / len(prefills), 1) if prefills else 0.0,
+        }
+        results.append(row)
+        print(f"{target:>8}  {ptoks:>7}  {row['ttft_p50_s']:>8.2f}s  "
+              f"{row['ttft_p90_s']:>8.2f}s  {row['decode_p50_tps']:>11.1f}  "
+              f"{row['decode_p90_tps']:>11.1f}  {row['prefill_tps']:>8.0f}")
 
     if results:
-        print(f"\nPeak generation: {max(r['gen_tps'] for r in results):.1f} tok/s")
-        print(f"Peak prompt:     {max(r['prompt_tps'] for r in results):.1f} tok/s")
+        print(f"\nBest median decode: {max(r['decode_p50_tps'] for r in results):.1f} tok/s")
 
     out = LOGS_DIR / f"bench-{key}.json"
     out.write_text(json.dumps(results, indent=2, default=str) + "\n")
@@ -670,12 +990,79 @@ def cmd_bench(args):
     if started_by_us:
         pid = get_running_pid(key)
         if pid:
-            try:
-                os.kill(pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
+            _terminate_pid(pid)
             pid_file_for(key).unlink(missing_ok=True)
             print(f"\n{cfg['name']} stopped (was started for benchmark).")
+
+
+def cmd_eval(args):
+    registry = load_registry()
+    key = get_model_key(registry, args.model)
+    cfg = get_model(registry, args.model)
+
+    _ensure_clean_for_bench(registry, key)
+    port, started_by_us = _start_for_bench(registry, key)
+
+    n = getattr(args, "questions", None) or 20
+    print(f"\nEvaluating {cfg['name']} on port {port}")
+
+    # ---- GSM8K: reasoning accuracy (exact-match auto-scored) ----
+    print(f"\n== GSM8K reasoning ({n} questions, exact-match auto-scored) ==")
+    questions = _load_gsm8k(n)
+    gsm_acc = None
+    if not questions:
+        print("  could not load GSM8K (offline?); skipping")
+    else:
+        correct = 0
+        rates = []
+        for i, q in enumerate(questions, 1):
+            gold = _extract_final_number(q.get("answer", ""))
+            prompt = (q.get("question", "") + "\n\nSolve step by step. End with "
+                      "the final numeric answer on its own line after '#### '.")
+            try:
+                r = _chat_stream(port, prompt, max_tokens=2048, enable_thinking=True)
+            except Exception as e:
+                print(f"  Q{i:>2}: ERROR {e}")
+                continue
+            pred = _extract_final_number(r["content"])
+            ok = gold is not None and pred is not None and abs(pred - gold) < 1e-4
+            correct += 1 if ok else 0
+            rates.append(r["decode_tps"])
+            print(f"  Q{i:>2}: {'PASS' if ok else 'fail'}  gold={gold}  "
+                  f"pred={pred}  ({r['decode_tps']:.0f} tok/s)")
+        gsm_acc = round(100.0 * correct / len(questions), 1)
+        avg = sum(rates) / len(rates) if rates else 0
+        print(f"  -> GSM8K: {correct}/{len(questions)} = {gsm_acc}%   "
+              f"avg decode {avg:.1f} tok/s")
+
+    # ---- Our own needle retrieval (auto-scored PASS/FAIL) ----
+    print(f"\n== Needle retrieval (our own test, auto-scored) ==")
+    needle = []
+    for ctx_tokens in [2000, 16000]:
+        hay = _build_haystack(ctx_tokens)
+        prompt = (f"{hay}\n\nWhat is the secret project codename? "
+                  "Answer with just the codename.")
+        try:
+            r = _chat_stream(port, prompt, max_tokens=64, enable_thinking=False)
+            found = "midnight falcon" in r["content"].lower()
+            print(f"  ~{ctx_tokens:>6} tok: {'PASS' if found else 'fail'}  "
+                  f"(prompt={r['prompt_tokens']} tok, {r['decode_tps']:.0f} tok/s)")
+            needle.append({"ctx": ctx_tokens, "found": found,
+                           "prompt_tokens": r["prompt_tokens"]})
+        except Exception as e:
+            print(f"  ~{ctx_tokens} tok: ERROR {e}")
+
+    out = LOGS_DIR / f"eval-{key}.json"
+    out.write_text(json.dumps({"gsm8k_accuracy_pct": gsm_acc, "needle": needle},
+                              indent=2, default=str) + "\n")
+    print(f"\nResults saved to {out}")
+
+    if started_by_us:
+        pid = get_running_pid(key)
+        if pid:
+            _terminate_pid(pid)
+            pid_file_for(key).unlink(missing_ok=True)
+            print(f"\n{cfg['name']} stopped (was started for eval).")
 
 
 # ── Add Model ───────────────────────────────────────────────────────────────
@@ -752,12 +1139,18 @@ def cmd_add(args):
         src_path = Path(source).resolve()
         _ensure_dirs()
         dest = MODELS_DIR / src_path.name
-        if not dest.exists():
-            os.symlink(src_path, dest)
-            print(f"Linked {src_path.name} -> {dest}")
+        linked = dest.exists()
+        if not linked:
+            try:
+                os.symlink(src_path, dest)
+                print(f"Linked {src_path.name} -> {dest}")
+                linked = True
+            except (OSError, NotImplementedError):
+                print("Symlink unavailable (needs admin or Developer Mode on "
+                      "Windows); registering absolute path instead.")
         if not name:
             name = src_path.stem.lower().replace(" ", "-")
-        source = str(dest)
+        source = str(dest) if linked else str(src_path)
 
     else:
         print(f"Source not found: {source}", file=sys.stderr)
@@ -775,7 +1168,7 @@ def cmd_add(args):
     key = name or model_file.replace(".gguf", "").lower()
     registry[key] = {
         "name": info.get("name", key),
-        "file": model_file,
+        "file": source,
         "binary": "default",
         "port": port,
         "context": info.get("context", 8192),
@@ -846,6 +1239,129 @@ def cmd_info(args):
 
 # ── Config ──────────────────────────────────────────────────────────────────
 
+def _coerce_value(v):
+    """Best-effort type coercion for `edit --set key=value` values."""
+    low = v.strip().lower()
+    if low in ("true", "false"):
+        return low == "true"
+    if low in ("null", "none"):
+        return None
+    try:
+        return int(v)
+    except ValueError:
+        pass
+    try:
+        return float(v)
+    except ValueError:
+        pass
+    if v[:1] in "[{":
+        try:
+            return json.loads(v)
+        except Exception:
+            pass
+    return v
+
+
+def cmd_edit(args):
+    registry = load_registry()
+    if not registry:
+        print("No models registered.", file=sys.stderr)
+        sys.exit(1)
+    key = get_model_key(registry, args.model)
+    if key not in registry:
+        print(f"Unknown model '{args.model}'. Run 'local-model list'.", file=sys.stderr)
+        sys.exit(1)
+    cfg = registry[key]
+
+    changes = []
+
+    def _set(field, value, label=None):
+        old = cfg.get(field, "(unset)")
+        cfg[field] = value
+        changes.append(f"{label or field}: {old!r} -> {value!r}")
+
+    if getattr(args, "rename_key", None) and args.rename_key != key:
+        new_key = args.rename_key
+        if new_key in registry:
+            print(f"  cannot rename: key '{new_key}' already exists", file=sys.stderr)
+            sys.exit(1)
+        registry[new_key] = registry.pop(key)
+        cfg = registry[new_key]
+        # Move the per-key sidecar files (pid, log, bench/test/eval results).
+        for old_f, new_f in [
+            (pid_file_for(key), pid_file_for(new_key)),
+            (log_file_for(key), log_file_for(new_key)),
+            (LOGS_DIR / f"bench-{key}.json", LOGS_DIR / f"bench-{new_key}.json"),
+            (LOGS_DIR / f"test-{key}.json", LOGS_DIR / f"test-{new_key}.json"),
+            (LOGS_DIR / f"eval-{key}.json", LOGS_DIR / f"eval-{new_key}.json"),
+        ]:
+            try:
+                if old_f.exists():
+                    old_f.replace(new_f)
+            except OSError:
+                pass
+        changes.append(f"key: '{key}' -> '{new_key}'")
+        key = new_key
+
+    if args.name is not None:
+        _set("name", args.name)
+    if args.description is not None:
+        _set("notes", args.description, "description")
+    if args.context is not None:
+        _set("context", args.context)
+    if args.cache_k is not None:
+        _set("cache_k", args.cache_k)
+    if args.cache_v is not None:
+        _set("cache_v", args.cache_v)
+    if args.threads is not None:
+        _set("threads", args.threads)
+    if args.flash_attn is not None:
+        _set("flash_attn", args.flash_attn)
+    if args.gpu_layers is not None:
+        _set("gpu_layers", args.gpu_layers)
+    if args.server_args is not None:
+        import shlex
+        _set("server_args", shlex.split(args.server_args))
+    if args.port is not None:
+        clash = [k for k, c in registry.items()
+                 if k != key and c.get("port") == args.port]
+        if clash:
+            print(f"  warning: port {args.port} also used by: {', '.join(clash)}",
+                  file=sys.stderr)
+        _set("port", args.port)
+    if args.set:
+        for kv in args.set:
+            if "=" not in kv:
+                print(f"  skipping malformed --set '{kv}' (need KEY=VALUE)",
+                      file=sys.stderr)
+                continue
+            k, _, v = kv.partition("=")
+            _set(k.strip(), _coerce_value(v))
+
+    if not changes:
+        # No edits requested -> act as an inspector and show current config.
+        print(f"\n{cfg.get('name', key)}  [{key}]")
+        for k in sorted(cfg):
+            val = cfg[k]
+            if isinstance(val, (dict, list)):
+                val = json.dumps(val)
+            print(f"  {k:<16} {val}")
+        print("\nEdit examples:")
+        print(f"  local-model edit {key} --port 8090 --context 131072")
+        print("  local-model edit " + key + ' --server-args "--no-mmap --jinja"')
+        print(f"  local-model edit {key} --set threads=12")
+        return
+
+    save_registry(registry)
+    print(f"Updated '{key}':")
+    for c in changes:
+        print(f"  {c}")
+
+    if get_running_pid(key):
+        print(f"\nNote: {cfg.get('name', key)} is running; changes take effect on "
+              f"next start  (local-model stop {key} ; local-model start {key}).")
+
+
 def cmd_config(args):
     config = _load_config()
 
@@ -902,8 +1418,10 @@ def cmd_help(args):
     print(f"  {'status':<30} Show running servers with health info")
     print(f"  {'test <model> [--prompts N]':<30} Run quality tests (reasoning, coding, factual)")
     print(f"  {'bench <model> [--ctx N]':<30} Run speed benchmark at multiple context sizes")
+    print(f"  {'eval <model> [--questions N]':<30} Accuracy eval (GSM8K reasoning + needle)")
     print(f"  {'add <path|hf:repo> [name]':<30} Register a new GGUF model")
     print(f"  {'info <model>':<30} Show model details (size, config, GGUF metadata)")
+    print(f"  {'edit <model> [--port N ...]':<30} Edit a model's name, port, context, runtime args")
     print(f"  {'config':<30} Show configuration and backend paths")
     print(f"  {'config --set-backend N path':<30} Configure a named backend binary")
     print(f"  {'help':<30} Show this help")
@@ -960,9 +1478,14 @@ def main():
     p.add_argument("model", help="Model name")
     p.add_argument("--prompts", type=int, help="Number of test prompts to run")
 
-    p = sub.add_parser("bench", help="Run speed benchmark")
+    p = sub.add_parser("bench", help="Run speed benchmark (TTFT + decode tok/s)")
     p.add_argument("model", help="Model name")
     p.add_argument("--ctx", type=int, help="Max context to test")
+    p.add_argument("--iters", type=int, help="Iterations per context length (default 3)")
+
+    p = sub.add_parser("eval", help="Accuracy eval (GSM8K reasoning + needle retrieval)")
+    p.add_argument("model", help="Model name")
+    p.add_argument("--questions", type=int, help="GSM8K questions to run (default 20)")
 
     p = sub.add_parser("add", help="Register a new GGUF model")
     p.add_argument("source", help="Path to GGUF file or hf:<repo> for Hugging Face")
@@ -970,6 +1493,23 @@ def main():
 
     p = sub.add_parser("info", help="Show model details")
     p.add_argument("model", help="Model name")
+
+    p = sub.add_parser("edit", help="Edit a registered model's settings")
+    p.add_argument("model", help="Model name/key")
+    p.add_argument("--name", help="Display name")
+    p.add_argument("--rename-key", metavar="NEWKEY",
+                   help="Rename the registry key/identifier used in commands")
+    p.add_argument("--description", help="Description / notes")
+    p.add_argument("--port", type=int, help="Port")
+    p.add_argument("--context", type=int, help="Context window size")
+    p.add_argument("--cache-k", help="KV cache K type (f16, q8_0, turbo3, ...)")
+    p.add_argument("--cache-v", help="KV cache V type")
+    p.add_argument("--threads", type=int, help="CPU threads")
+    p.add_argument("--flash-attn", choices=["on", "off", "auto"], help="Flash attention")
+    p.add_argument("--gpu-layers", type=int, help="GPU layers (-ngl)")
+    p.add_argument("--server-args", help="Raw extra server args, quoted; replaces existing")
+    p.add_argument("--set", action="append", metavar="KEY=VALUE",
+                   help="Set an arbitrary config field (repeatable; value auto-typed)")
 
     p = sub.add_parser("config", help="Show / edit configuration")
     p.add_argument("--set-backend", nargs=2, metavar=("NAME", "PATH"),
@@ -992,8 +1532,10 @@ def main():
         "status": cmd_status,
         "test": cmd_test,
         "bench": cmd_bench,
+        "eval": cmd_eval,
         "add": cmd_add,
         "info": cmd_info,
+        "edit": cmd_edit,
         "config": cmd_config,
         "help": cmd_help,
     }
