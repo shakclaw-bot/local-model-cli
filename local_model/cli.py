@@ -237,6 +237,36 @@ def get_running_pid(key):
     return None
 
 
+def _is_remote(cfg):
+    return bool(cfg.get("remote"))
+
+
+def _model_endpoint(cfg):
+    """OpenAI base URL (.../v1) for a model: remote 'url' if set, else local port."""
+    if _is_remote(cfg) and cfg.get("url"):
+        return cfg["url"].rstrip("/")
+    return f"http://127.0.0.1:{cfg.get('port', 8080)}/v1"
+
+
+def _check_endpoint(cfg, timeout=5):
+    """Reachability via GET <endpoint>/models. Works for local and remote."""
+    try:
+        r = urllib.request.urlopen(_model_endpoint(cfg) + "/models", timeout=timeout)
+        return r.getcode() == 200
+    except Exception:
+        return False
+
+
+def _normalize_remote_url(u):
+    """Accept host:port or a full URL; normalize to a .../v1 base URL."""
+    u = u.strip().rstrip("/")
+    if not u.startswith(("http://", "https://")):
+        u = "http://" + u
+    if not u.endswith("/v1"):
+        u = u + "/v1"
+    return u
+
+
 def check_health(port, timeout=3):
     try:
         r = urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=timeout)
@@ -401,6 +431,14 @@ def cmd_list(args):
         in_str = f"{prompt_speed:.0f}" if prompt_speed else "-"
         out_str = f"{gen_speed:.1f}" if gen_speed else "-"
 
+        if _is_remote(cfg):
+            reachable = _check_endpoint(cfg)
+            status = ("\033[36mremote ok\033[0m" if reachable
+                      else "\033[31mremote down\033[0m")
+            rows.append([key, cfg.get("name", "?"), "remote", ctx_str,
+                         in_str, out_str, status])
+            continue
+
         pid = get_running_pid(key)
         model_path = resolve_model_path(cfg)
         if not model_path:
@@ -436,6 +474,21 @@ def cmd_start(args):
     registry = load_registry()
     key = get_model_key(registry, args.model)
     cfg = get_model(registry, args.model)
+
+    if _is_remote(cfg):
+        base = _model_endpoint(cfg)
+        print(f"{cfg.get('name', key)} is a remote model (not started locally).")
+        print(f"  endpoint: {base}")
+        if _check_endpoint(cfg):
+            print("  status:   reachable")
+            print(f"\nPoint your client (Hermes / OpenClaw / any OpenAI SDK) at:")
+            print(f"  {base}")
+        else:
+            print("  status:   NOT reachable", file=sys.stderr)
+            print("  (is the remote host's model running and Tailscale up?)",
+                  file=sys.stderr)
+            sys.exit(1)
+        return
 
     pid = get_running_pid(key)
     if pid and check_health(cfg["port"]):
@@ -524,6 +577,13 @@ def cmd_status(args):
     found = False
 
     for key, cfg in sorted(registry.items()):
+        if _is_remote(cfg):
+            found = True
+            base = _model_endpoint(cfg)
+            print(f"\n{cfg.get('name', key)}  [remote]")
+            print(f"  Endpoint: {base}")
+            print(f"  Health:   {'OK' if _check_endpoint(cfg) else 'UNREACHABLE'}")
+            continue
         pid = get_running_pid(key)
         if not pid:
             continue
@@ -1358,6 +1418,26 @@ def _coerce_value(v):
     return v
 
 
+def _pi_installed():
+    """True if pi appears installed on this machine: the `pi` binary is on PATH,
+    or the ~/.pi/agent config directory exists. Lets sync be a clean no-op on
+    machines without pi rather than emitting confusing output."""
+    if shutil.which("pi"):
+        return True
+    return (Path(os.path.expanduser("~")) / ".pi" / "agent").is_dir()
+
+
+def cmd_sync_pi(args):
+    # Pi is registry-driven: the extension reads ~/.local-model/registry.json
+    # directly, so there are no files to patch. This just guides you to refresh.
+    if not _pi_installed():
+        print("pi not detected on this machine; nothing to do.")
+        return
+    print("pi reads the local-model registry directly -- no file sync needed.")
+    print("After adding or editing models, run /reload in pi (or restart it)")
+    print("to refresh the model list, context windows, and ports.")
+
+
 def cmd_edit(args):
     registry = load_registry()
     if not registry:
@@ -1453,9 +1533,44 @@ def cmd_edit(args):
     for c in changes:
         print(f"  {c}")
 
+    # Pi reads the registry directly (registry-driven extension); remind to
+    # reload when a pi-visible field changed.
+    if _pi_installed() and (args.name is not None or args.context is not None
+                            or args.port is not None
+                            or getattr(args, "rename_key", None)):
+        print("  (pi reads the registry live; run /reload in pi to apply.)")
+
     if get_running_pid(key):
         print(f"\nNote: {cfg.get('name', key)} is running; changes take effect on "
               f"next start  (local-model stop {key} ; local-model start {key}).")
+
+
+def cmd_add_remote(args):
+    registry = load_registry()
+    url = _normalize_remote_url(args.url)
+    name = args.name or "remote model"
+    base_key = (args.name or "remote").lower().replace(" ", "-")
+    key = base_key
+    i = 2
+    while key in registry:
+        key = f"{base_key}-{i}"
+        i += 1
+    registry[key] = {
+        "name": name,
+        "remote": True,
+        "url": url,
+        "context": args.context or 8192,
+        "notes": f"Remote model at {url}",
+    }
+    save_registry(registry)
+    print(f"Registered remote model '{key}':")
+    print(f"  name:    {name}")
+    print(f"  url:     {url}")
+    print(f"  context: {registry[key]['context']}")
+    reachable = _check_endpoint(registry[key])
+    print(f"  reachable: {'yes' if reachable else 'no (remote down or Tailscale off)'}")
+    print(f"\nVerify with: local-model start {key}")
+    print(f"Use it by pointing your client at: {url}")
 
 
 def cmd_config(args):
@@ -1518,6 +1633,8 @@ def cmd_help(args):
     print(f"  {'add <path|hf:repo> [name]':<30} Register a new GGUF model")
     print(f"  {'info <model>':<30} Show model details (size, config, GGUF metadata)")
     print(f"  {'edit <model> [--port N ...]':<30} Edit a model's name, port, context, runtime args")
+    print(f"  {'add-remote <url> [name]':<30} Register a remote model (e.g. over Tailscale)")
+    print(f"  {'sync-pi':<30} How to refresh pi after registry changes")
     print(f"  {'config':<30} Show configuration and backend paths")
     print(f"  {'config --set-backend N path':<30} Configure a named backend binary")
     print(f"  {'help':<30} Show this help")
@@ -1587,6 +1704,11 @@ def main():
     p.add_argument("source", help="Path to GGUF file or hf:<repo> for Hugging Face")
     p.add_argument("name", nargs="?", help="Short name for the model")
 
+    p = sub.add_parser("add-remote", help="Register a remote (already-running) model by URL")
+    p.add_argument("url", help="Base URL or host:port of the remote llama-server")
+    p.add_argument("name", nargs="?", help="Short name for the model")
+    p.add_argument("--context", type=int, help="Context window (default 8192)")
+
     p = sub.add_parser("info", help="Show model details")
     p.add_argument("model", help="Model name")
 
@@ -1606,6 +1728,9 @@ def main():
     p.add_argument("--server-args", help="Raw extra server args, quoted; replaces existing")
     p.add_argument("--set", action="append", metavar="KEY=VALUE",
                    help="Set an arbitrary config field (repeatable; value auto-typed)")
+
+    p = sub.add_parser("sync-pi", help="How to refresh pi after registry changes (registry-driven)")
+    p.add_argument("model", nargs="?", help="Model name (default: all registered)")
 
     p = sub.add_parser("config", help="Show / edit configuration")
     p.add_argument("--set-backend", nargs=2, metavar=("NAME", "PATH"),
@@ -1630,8 +1755,10 @@ def main():
         "bench": cmd_bench,
         "eval": cmd_eval,
         "add": cmd_add,
+        "add-remote": cmd_add_remote,
         "info": cmd_info,
         "edit": cmd_edit,
+        "sync-pi": cmd_sync_pi,
         "config": cmd_config,
         "help": cmd_help,
     }
