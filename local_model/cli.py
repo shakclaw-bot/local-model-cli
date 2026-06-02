@@ -3018,7 +3018,62 @@ Register-ArgumentCompleter -Native -CommandName local-model -ScriptBlock {{
 """
 
 
+def _powershell_profile_path():
+    script = "$PROFILE"
+    try:
+        r = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", script],
+            capture_output=True, text=True, timeout=5,
+        )
+        path = (r.stdout or "").strip()
+        return Path(path) if path else None
+    except Exception:
+        return None
+
+
+def _install_powershell_completion():
+    profile = _powershell_profile_path()
+    if not profile:
+        print("Could not resolve PowerShell profile path.", file=sys.stderr)
+        sys.exit(1)
+
+    start = "# >>> local-model completion >>>"
+    end = "# <<< local-model completion <<<"
+    block = (
+        f"{start}\n"
+        "local-model completion powershell | Out-String | Invoke-Expression\n"
+        f"{end}\n"
+    )
+    existing = profile.read_text() if profile.exists() else ""
+    if start in existing:
+        print(f"PowerShell completion already installed in: {profile}")
+        return
+
+    profile.parent.mkdir(parents=True, exist_ok=True)
+    with open(profile, "a", encoding="utf-8") as f:
+        if existing and not existing.endswith(("\n", "\r")):
+            f.write("\n")
+        f.write("\n" + block)
+
+    print(f"Installed PowerShell completion in: {profile}")
+    print("Open a new PowerShell session, or run this now:")
+    print("  local-model completion powershell | Out-String | Invoke-Expression")
+
+
 def cmd_completion(args):
+    if args.action == "powershell":
+        args.shell = "powershell"
+        args.action = "print"
+    if not args.shell:
+        args.shell = "powershell"
+
+    if args.action == "install":
+        if args.shell == "powershell":
+            _install_powershell_completion()
+            return
+        print(f"Unsupported shell: {args.shell}", file=sys.stderr)
+        sys.exit(1)
+
     if args.shell == "powershell":
         print(_powershell_completion_script())
         return
@@ -3045,7 +3100,7 @@ def cmd_help(args):
     print(f"  {'edit <model> [--port N ...]':<30} Edit a model's name, port, context, runtime args")
     print(f"  {'add-remote <url> [name]':<30} Register a remote model (e.g. over Tailscale)")
     print(f"  {'sync-pi':<30} How to refresh pi after registry changes")
-    print(f"  {'completion powershell':<30} Print PowerShell tab completion setup")
+    print(f"  {'completion install powershell':<30} Enable PowerShell tab completion")
     print(f"  {'config':<30} Show configuration and backend paths")
     print(f"  {'config --set-backend N path':<30} Configure a named backend binary")
     print(f"  {'help':<30} Show this help")
@@ -3175,8 +3230,12 @@ def main():
     p = sub.add_parser("sync-pi", help="How to refresh pi after registry changes (registry-driven)")
     p.add_argument("model", nargs="?", help="Model name (default: all registered)")
 
-    p = sub.add_parser("completion", help="Print shell completion setup")
-    p.add_argument("shell", choices=["powershell"], help="Shell to generate completion for")
+    p = sub.add_parser("completion", help="Print or install shell completion setup")
+    p.add_argument("action", nargs="?", default="print",
+                   choices=["print", "install", "powershell"],
+                   help="Use 'install' to add completion to your shell profile")
+    p.add_argument("shell", nargs="?", choices=["powershell"],
+                   help="Shell to generate/install completion for")
 
     p = sub.add_parser("complete", help=argparse.SUPPRESS)
     p.add_argument("kind", choices=["commands", "models"])
