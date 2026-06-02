@@ -349,6 +349,21 @@ def _local_ip_address():
     return None
 
 
+def _local_scan_hosts():
+    hosts = {"127.0.0.1", "localhost", "::1"}
+    lan_ip = _local_ip_address()
+    if lan_ip:
+        hosts.add(lan_ip)
+    try:
+        hosts.add(socket.gethostname().lower())
+        fqdn = socket.getfqdn()
+        if fqdn:
+            hosts.add(fqdn.lower())
+    except Exception:
+        pass
+    return hosts
+
+
 def _default_scan_targets():
     targets = ["127.0.0.1"]
     lan = _local_lan_cidr()
@@ -452,6 +467,70 @@ def _probe_openai_models(host, port, timeout):
         "url": base,
         "models": models,
     }
+
+
+def _windows_inbound_tcp_allow_ports(ports):
+    if os.name != "nt" or not ports:
+        return None
+    ps = (
+        "$ports = @(" + ",".join(str(int(p)) for p in sorted(set(ports))) + "); "
+        "$rules = Get-NetFirewallRule -Enabled True -Direction Inbound -Action Allow "
+        "-ErrorAction SilentlyContinue | "
+        "Get-NetFirewallPortFilter -ErrorAction SilentlyContinue | "
+        "Where-Object { $_.Protocol -eq 'TCP' }; "
+        "$allowed = foreach ($p in $ports) { "
+        "  foreach ($r in $rules) { "
+        "    if ($r.LocalPort -eq 'Any' -or ($r.LocalPort -split ',' | ForEach-Object { $_.Trim() }) -contains [string]$p) { $p; break } "
+        "  } "
+        "}; "
+        "$allowed | Sort-Object -Unique | ConvertTo-Json -Compress"
+    )
+    try:
+        r = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", ps],
+            capture_output=True, text=True, timeout=8,
+        )
+        if r.returncode != 0:
+            return None
+        text = (r.stdout or "").strip()
+        if not text:
+            return set()
+        data = json.loads(text)
+        if isinstance(data, int):
+            data = [data]
+        return {int(p) for p in data}
+    except Exception:
+        return None
+
+
+def _print_windows_firewall_scan_hint(probe_pairs):
+    if os.name != "nt":
+        return
+    local_hosts = _local_scan_hosts()
+    local_ports = {
+        int(port) for host, port in probe_pairs
+        if str(host).lower() in local_hosts
+    }
+    if not local_ports:
+        return
+
+    allowed = _windows_inbound_tcp_allow_ports(local_ports)
+    print("\nWindows Firewall:")
+    if allowed is None:
+        print("  Could not inspect inbound TCP allow rules (permissions or firewall cmdlets unavailable).")
+        print("  If LAN clients cannot connect, run PowerShell as Administrator and allow the model port, e.g.:")
+        port = sorted(local_ports)[0]
+        print(f"  New-NetFirewallRule -DisplayName \"local-model {port}\" -Direction Inbound -Action Allow -Protocol TCP -LocalPort {port}")
+        return
+
+    missing = sorted(local_ports - allowed)
+    for port in sorted(local_ports):
+        status = "allow rule found" if port in allowed else "no allow rule found"
+        print(f"  TCP {port}: {status}")
+    if missing:
+        ports_text = ",".join(str(p) for p in missing)
+        print("  If another device cannot connect, run PowerShell as Administrator:")
+        print(f"  New-NetFirewallRule -DisplayName \"local-model {ports_text}\" -Direction Inbound -Action Allow -Protocol TCP -LocalPort {ports_text}")
 
 
 def _safe_key(value, fallback="remote"):
@@ -2847,6 +2926,7 @@ def cmd_scan(args):
                 probe_pairs.append(pair)
 
     print(f"Scanning {len(probe_pairs)} endpoint(s) for /v1/models...")
+    _print_windows_firewall_scan_hint(probe_pairs)
 
     found = []
     workers = max(1, min(args.workers, len(probe_pairs)))
@@ -2975,9 +3055,10 @@ def cmd_serve(args):
         sys.exit(1)
 
     lan = getattr(args, "lan", False)
+    use_tailscale = (not lan) or getattr(args, "tailscale", False)
     port = cfg.get("port", 8080)
     ts = _tailscale_bin()
-    if not ts and not lan:
+    if use_tailscale and not ts:
         print("tailscale CLI not found.", file=sys.stderr)
         print("Install Tailscale and sign in, then retry.", file=sys.stderr)
         sys.exit(1)
@@ -3012,9 +3093,9 @@ def cmd_serve(args):
         cmd_start(args)
 
     # 2. Map the device's :443 to the local model port over Tailscale when
-    #    available. --lan can be used on machines without Tailscale installed.
+    #    requested. --lan alone is LAN-only.
     url = None
-    if ts:
+    if use_tailscale and ts:
         print(f"\nExposing port {port} over Tailscale (HTTPS)...")
         r = subprocess.run(
             [ts, "serve", "--bg", "--https=443", f"http://127.0.0.1:{port}"],
@@ -3028,7 +3109,7 @@ def cmd_serve(args):
                 print("  https://login.tailscale.com/admin/dns", file=sys.stderr)
             else:
                 print(out.strip() or "tailscale serve failed", file=sys.stderr)
-            if not lan:
+            if use_tailscale and not lan:
                 sys.exit(1)
         else:
             url = _parse_serve_url(out) or _tailscale_https_url(ts)
@@ -3057,7 +3138,7 @@ def cmd_serve(args):
         print(f"  OpenAI: {base}")
     print(f"  Model:  {cfg.get('name', key)} (port {port})")
     print(f"  Health: {'OK' if check_health(port) else 'NOT READY'}")
-    client_base = base or lan_base
+    client_base = lan_base if lan else base
     if client_base:
         print("\nPoint a remote client (Hermes / OpenClaw / any OpenAI SDK) at:")
         print(f"  base_url = {client_base}")
@@ -3308,6 +3389,8 @@ def main():
     p.add_argument("--ctx", type=int, help="Override context window when starting")
     p.add_argument("--lan", action="store_true",
                    help="Bind to 0.0.0.0 and print the LAN OpenAI base URL")
+    p.add_argument("--tailscale", action="store_true",
+                   help="Also expose over Tailscale when using --lan")
     p.add_argument("--off", action="store_true",
                    help="Stop serving (remove the Tailscale HTTPS mapping)")
 
