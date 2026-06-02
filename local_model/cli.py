@@ -261,6 +261,33 @@ def _check_endpoint(cfg, timeout=5):
         return False
 
 
+def _remote_model_id(cfg, key=None):
+    for field in ("model", "model_id", "id"):
+        if cfg.get(field):
+            return str(cfg[field])
+    models = cfg.get("models")
+    if isinstance(models, list) and models:
+        return str(models[0])
+    return cfg.get("name") or key or "remote"
+
+
+def _connected_remote():
+    connected = _load_config().get("connected_remote")
+    return connected if isinstance(connected, dict) else {}
+
+
+def _set_connected_remote(key, cfg):
+    config = _load_config()
+    config["connected_remote"] = {
+        "key": key,
+        "name": cfg.get("name", key),
+        "url": _model_endpoint(cfg),
+        "model": _remote_model_id(cfg, key),
+        "connected_at": int(time.time()),
+    }
+    _save_config(config)
+
+
 def _normalize_remote_url(u):
     """Accept host:port or a full URL; normalize to a .../v1 base URL."""
     u = u.strip().rstrip("/")
@@ -1185,6 +1212,7 @@ def _get_bench_speeds(key):
 
 def cmd_list(args):
     registry = load_registry()
+    connected = _connected_remote()
     processes = _process_snapshots()
     external = _external_rows(processes)
     if not registry and not external:
@@ -1209,8 +1237,12 @@ def cmd_list(args):
 
         if _is_remote(cfg):
             reachable = _check_endpoint(cfg)
-            status = ("\033[36mremote ok\033[0m" if reachable
-                      else "\033[31mremote down\033[0m")
+            if connected.get("key") == key and reachable:
+                status = "\033[32mconnected\033[0m"
+            elif reachable:
+                status = "\033[36monline\033[0m"
+            else:
+                status = "\033[31moffline\033[0m"
             rows.append([key, "local-model", "llm", cfg.get("name", "?"),
                          "remote", ctx_str, "-", "-", "-", status])
             continue
@@ -1279,15 +1311,19 @@ def cmd_start(args):
 
     if _is_remote(cfg):
         base = _model_endpoint(cfg)
-        print(f"{cfg.get('name', key)} is a remote model (not started locally).")
+        model_id = _remote_model_id(cfg, key)
+        print(f"{cfg.get('name', key)} is a remote model.")
         print(f"  endpoint: {base}")
         if _check_endpoint(cfg):
-            print("  status:   reachable")
+            _set_connected_remote(key, cfg)
+            print("  status:   connected")
             print(f"\nPoint your client (Hermes / OpenClaw / any OpenAI SDK) at:")
-            print(f"  {base}")
+            print(f"  base_url = {base}")
+            print(f"  model    = {model_id}")
+            print("  api_key  = not-needed")
         else:
-            print("  status:   NOT reachable", file=sys.stderr)
-            print("  (is the remote host's model running and Tailscale up?)",
+            print("  status:   offline", file=sys.stderr)
+            print("  (is the remote host serving the model, and is the network path up?)",
                   file=sys.stderr)
             sys.exit(1)
         return
@@ -1382,15 +1418,21 @@ def cmd_stop(args):
 
 def cmd_status(args):
     registry = load_registry()
+    connected = _connected_remote()
     found = False
 
     for key, cfg in sorted(registry.items()):
         if _is_remote(cfg):
             found = True
             base = _model_endpoint(cfg)
+            reachable = _check_endpoint(cfg)
+            state = "connected" if connected.get("key") == key and reachable else (
+                "online" if reachable else "offline"
+            )
             print(f"\n{cfg.get('name', key)}  [remote]")
             print(f"  Endpoint: {base}")
-            print(f"  Health:   {'OK' if _check_endpoint(cfg) else 'UNREACHABLE'}")
+            print(f"  Model:    {_remote_model_id(cfg, key)}")
+            print(f"  Status:   {state}")
             continue
         pid = get_running_pid(key)
         if not pid:
@@ -2550,6 +2592,71 @@ def cmd_add_remote(args):
     print(f"Use it by pointing your client at: {url}")
 
 
+def _remote_registry_identity(cfg):
+    if not (_is_remote(cfg) and cfg.get("url")):
+        return None
+    return (_normalize_remote_url(cfg["url"]), _remote_model_id(cfg))
+
+
+def _scan_choices(found):
+    choices = []
+    for item in found:
+        for model_id in item["models"]:
+            choices.append({
+                "host": item["host"],
+                "port": item["port"],
+                "url": _normalize_remote_url(item["url"]),
+                "model": model_id,
+            })
+    return choices
+
+
+def _parse_selection(text, count):
+    text = (text or "").strip().lower()
+    if not text:
+        return []
+    if text in ("a", "all"):
+        return list(range(count))
+    selected = set()
+    for part in text.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            start, _, end = part.partition("-")
+            try:
+                first, last = int(start), int(end)
+            except ValueError:
+                raise ValueError(f"invalid selection '{part}'")
+            if first > last:
+                first, last = last, first
+            nums = range(first, last + 1)
+        else:
+            try:
+                nums = [int(part)]
+            except ValueError:
+                raise ValueError(f"invalid selection '{part}'")
+        for num in nums:
+            if num < 1 or num > count:
+                raise ValueError(f"selection out of range: {num}")
+            selected.add(num - 1)
+    return sorted(selected)
+
+
+def _register_remote_choice(registry, choice, context):
+    key = _unique_key(registry, _safe_key(choice["model"]))
+    registry[key] = {
+        "name": choice["model"],
+        "remote": True,
+        "url": choice["url"],
+        "model": choice["model"],
+        "context": context,
+        "models": [choice["model"]],
+        "notes": f"Discovered by network scan at {choice['host']}:{choice['port']}",
+    }
+    return key
+
+
 def cmd_scan(args):
     try:
         ports = _parse_port_list(args.ports)
@@ -2597,13 +2704,13 @@ def cmd_scan(args):
         print("No OpenAI-compatible model endpoints found.")
         return
 
+    choices = _scan_choices(found)
     registry = load_registry()
-    existing_urls = {
-        _normalize_remote_url(cfg.get("url", ""))
-        for cfg in registry.values()
-        if _is_remote(cfg) and cfg.get("url")
+    existing = {
+        identity for identity in (_remote_registry_identity(cfg)
+                                 for cfg in registry.values())
+        if identity
     }
-    registered = []
 
     print(f"\n{'Endpoint':<28} {'Models'}")
     print("-" * 80)
@@ -2613,37 +2720,51 @@ def cmd_scan(args):
             models += f", +{len(item['models']) - 4} more"
         print(f"{item['url']:<28} {models}")
 
-        if not args.register:
-            continue
-
-        url = _normalize_remote_url(item["url"])
-        if url in existing_urls:
-            registered.append((url, "already registered"))
-            continue
-        model_name = item["models"][0] if item["models"] else f"{item['host']}:{item['port']}"
-        key = _unique_key(registry, _safe_key(model_name))
-        registry[key] = {
-            "name": model_name,
-            "remote": True,
-            "url": url,
-            "context": args.context,
-            "models": item["models"],
-            "notes": f"Discovered by network scan at {item['host']}:{item['port']}",
-        }
-        existing_urls.add(url)
-        registered.append((url, key))
-
+    selected_indexes = []
     if args.register:
-        if any(key != "already registered" for _url, key in registered):
-            save_registry(registry)
-        print("\nRegistration:")
-        for url, key in registered:
-            if key == "already registered":
-                print(f"  {url}: already registered")
-            else:
-                print(f"  {url}: registered as '{key}'")
+        selected_indexes = list(range(len(choices)))
+    elif sys.stdin.isatty():
+        print("\nDiscovered models:")
+        for i, choice in enumerate(choices, 1):
+            mark = "x" if (choice["url"], choice["model"]) in existing else " "
+            suffix = " (already added)" if mark == "x" else ""
+            print(f"  [{mark}] {i:>2}. {choice['model']}  @  {choice['url']}{suffix}")
+        print("  [>] Add selected models")
+        try:
+            answer = input("\nSelect models to add (1,3-5 or all; Enter skips): ")
+            selected_indexes = _parse_selection(answer, len(choices))
+        except ValueError as exc:
+            print(f"scan: {exc}", file=sys.stderr)
+            sys.exit(1)
     else:
-        print("\nRegister discovered endpoints with: local-model scan --register")
+        print("\nRegister discovered models with: local-model scan --register")
+
+    if not selected_indexes:
+        return
+
+    registered = []
+    for idx in selected_indexes:
+        choice = choices[idx]
+        identity = (choice["url"], choice["model"])
+        if identity in existing:
+            registered.append((choice["model"], choice["url"], "already registered"))
+            continue
+        key = _register_remote_choice(registry, choice, args.context)
+        existing.add(identity)
+        registered.append((choice["model"], choice["url"], key))
+
+    if any(key != "already registered" for _model, _url, key in registered):
+        save_registry(registry)
+    print("\nRegistration:")
+    for model, url, key in registered:
+        if key == "already registered":
+            print(f"  {model} @ {url}: already registered")
+        else:
+            print(f"  {model} @ {url}: registered as '{key}'")
+    print("\nConnect with:")
+    for _model, _url, key in registered:
+        if key != "already registered":
+            print(f"  local-model start {key}")
 
 
 def _tailscale_bin():
@@ -2928,7 +3049,7 @@ def main():
     p.add_argument("--max-hosts", type=int, default=512,
                    help="Safety limit for expanded targets")
     p.add_argument("--register", action="store_true",
-                   help="Register discovered endpoints as remote models")
+                   help="Register all discovered models without prompting")
     p.add_argument("--context", type=int, default=8192,
                    help="Context window used for registrations")
 
