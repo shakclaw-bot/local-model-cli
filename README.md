@@ -133,6 +133,7 @@ Example `bench` output:
 |---------|-------------|
 | `local-model list` | Show registered models with status and bench speeds |
 | `local-model start <model> [--ctx N]` | Start a model server |
+| `local-model serve <model> [--lan]` | Expose a model over Tailscale HTTPS and/or your LAN |
 | `local-model stop <model\|all>` | Stop running server(s) |
 | `local-model status` | Show running servers with health and slot info |
 | `local-model scan [--register]` | Scan localhost and the LAN for OpenAI-compatible `/v1/models` endpoints |
@@ -233,6 +234,17 @@ local-model scan --register
 ```
 
 By default, scanning is read-only. Add `--register` to save each discovered endpoint as a remote model in `~/.local-model/registry.json`; duplicate remote URLs are skipped.
+
+To make a local model discoverable from another machine on your LAN, serve it with `--lan`:
+
+```bash
+local-model serve bonsai --lan
+# prints, for example: http://192.168.1.25:8080/v1
+
+local-model scan --target 192.168.1.25 --ports 8080
+```
+
+`--lan` binds the model server to `0.0.0.0`; allow inbound TCP for the model port in your OS firewall if another device cannot reach it.
 
 ## VRAM auto-sizing for MoE models (`auto_ncmoe`)
 

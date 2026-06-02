@@ -4,6 +4,7 @@
 Usage:
   local-model list                        Show available models and their status
   local-model start <model> [--ctx N]     Start a model server
+  local-model serve <model> [--lan]       Expose a model over Tailscale/LAN
   local-model stop <model|all>            Stop a running model server
   local-model status                      Show running servers with health + memory
   local-model monitor                     Show RAM/VRAM attribution bars
@@ -301,17 +302,22 @@ def _parse_port_list(text):
 
 
 def _local_lan_cidr():
+    host = _local_ip_address()
+    if host and not host.startswith("127."):
+        return f"{host}/24"
+    return None
+
+
+def _local_ip_address():
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
             s.connect(("8.8.8.8", 80))
-            host = s.getsockname()[0]
+            return s.getsockname()[0]
         finally:
             s.close()
-        if host and not host.startswith("127."):
-            return f"{host}/24"
     except Exception:
-        pass
+        return None
     return None
 
 
@@ -392,6 +398,20 @@ def _unique_key(registry, base_key):
         key = f"{base_key}-{i}"
         i += 1
     return key
+
+
+def _lan_model_url(port):
+    lan_ip = _local_ip_address()
+    if not lan_ip or lan_ip.startswith("127."):
+        return None
+    return f"http://{lan_ip}:{port}/v1"
+
+
+def _check_lan_endpoint(port, timeout=1.0):
+    url = _lan_model_url(port)
+    if not url:
+        return False
+    return bool(_models_from_payload(_http_json(url + "/models", timeout=timeout)))
 
 
 def check_health(port, timeout=3):
@@ -1078,7 +1098,15 @@ def _compute_ncmoe(cfg, ctx, quiet=False):
     return ncmoe
 
 
-def _build_server_cmd(cfg, binary, model_path, port, ctx):
+def _server_host(cfg, args=None):
+    if getattr(args, "lan", False):
+        return "0.0.0.0"
+    if getattr(args, "host", None):
+        return args.host
+    return cfg.get("host", "127.0.0.1")
+
+
+def _build_server_cmd(cfg, binary, model_path, port, ctx, host="127.0.0.1"):
     cmd = [
         binary, "-m", model_path,
         "-ngl", str(cfg.get("gpu_layers", 99)),
@@ -1088,7 +1116,7 @@ def _build_server_cmd(cfg, binary, model_path, port, ctx):
         "-ctv", cfg.get("cache_v", "f16"),
         "--threads", str(cfg.get("threads", 4)),
         "-np", "1",
-        "--host", "127.0.0.1",
+        "--host", host,
         "--port", str(port),
     ]
     mmproj = cfg.get("mmproj")
@@ -1265,6 +1293,8 @@ def cmd_start(args):
         return
 
     pid = get_running_pid(key)
+    host = _server_host(cfg, args)
+
     if pid and check_health(cfg["port"]):
         print(f"{cfg['name']} is already running on port {cfg['port']} (PID {pid})")
         return
@@ -1290,11 +1320,11 @@ def cmd_start(args):
         sys.exit(1)
 
     ctx = args.ctx or cfg.get("context", 8192)
-    cmd = _build_server_cmd(cfg, binary, model_path, port, ctx)
+    cmd = _build_server_cmd(cfg, binary, model_path, port, ctx, host)
 
     log_f = log_file_for(key)
     print(f"Starting {cfg['name']}...")
-    print(f"  port: {port}  ctx: {ctx}  {_describe_config(cfg)}")
+    print(f"  host: {host}  port: {port}  ctx: {ctx}  {_describe_config(cfg)}")
 
     with open(log_f, "w") as lf:
         proc = subprocess.Popen(cmd, stdout=lf, stderr=subprocess.STDOUT)
@@ -1313,6 +1343,10 @@ def cmd_start(args):
             elapsed = time.monotonic() - t0
             print(f" ready ({elapsed:.0f}s)")
             print(f"\n{cfg['name']} is running on port {port}.")
+            if host == "0.0.0.0":
+                lan_ip = _local_ip_address()
+                if lan_ip:
+                    print(f"  LAN: http://{lan_ip}:{port}/v1")
             return
         time.sleep(1)
         print(".", end="", flush=True)
@@ -2643,7 +2677,7 @@ def _tailscale_https_url(ts):
 
 
 def cmd_serve(args):
-    """Expose a local model over Tailscale HTTPS, starting it first if needed."""
+    """Expose a local model over Tailscale HTTPS and/or the LAN."""
     _ensure_dirs()
     registry = load_registry()
     key = get_model_key(registry, args.model)
@@ -2654,15 +2688,19 @@ def cmd_serve(args):
               file=sys.stderr)
         sys.exit(1)
 
+    lan = getattr(args, "lan", False)
     port = cfg.get("port", 8080)
     ts = _tailscale_bin()
-    if not ts:
+    if not ts and not lan:
         print("tailscale CLI not found.", file=sys.stderr)
         print("Install Tailscale and sign in, then retry.", file=sys.stderr)
         sys.exit(1)
 
     # --off: remove the proxy mapping and exit.
     if getattr(args, "off", False):
+        if not ts:
+            print("tailscale CLI not found.", file=sys.stderr)
+            sys.exit(1)
         r = subprocess.run([ts, "serve", "--https=443", "off"],
                            capture_output=True, text=True)
         if r.returncode == 0:
@@ -2673,48 +2711,76 @@ def cmd_serve(args):
             sys.exit(1)
         return
 
-    # 1. Ensure the model is up. cmd_start reports the already-running case and
-    #    exits non-zero on failure (which aborts serve too).
+    # 1. Ensure the model is up. For LAN serving, restart a localhost-bound
+    #    process so llama-server listens on 0.0.0.0.
     pid = get_running_pid(key)
+    if lan and pid and check_health(port) and not _check_lan_endpoint(port):
+        print(f"{cfg.get('name', key)} is running on localhost; restarting for LAN...")
+        _terminate_pid(pid)
+        time.sleep(2)
+        pid = None
+
     if pid and check_health(port):
         print(f"{cfg.get('name', key)} already running on port {port} (PID {pid}).")
     else:
         cmd_start(args)
 
-    # 2. Map the device's :443 to the local model port over Tailscale.
-    print(f"\nExposing port {port} over Tailscale (HTTPS)...")
-    r = subprocess.run(
-        [ts, "serve", "--bg", "--https=443", f"http://127.0.0.1:{port}"],
-        capture_output=True, text=True)
-    out = (r.stdout or "") + (r.stderr or "")
-    if r.returncode != 0:
-        if "not enabled" in out.lower():
-            print("Tailscale Serve is not enabled on your tailnet.", file=sys.stderr)
-            print("Enable HTTPS Certificates in the admin console, then retry:",
-                  file=sys.stderr)
-            print("  https://login.tailscale.com/admin/dns", file=sys.stderr)
+    # 2. Map the device's :443 to the local model port over Tailscale when
+    #    available. --lan can be used on machines without Tailscale installed.
+    url = None
+    if ts:
+        print(f"\nExposing port {port} over Tailscale (HTTPS)...")
+        r = subprocess.run(
+            [ts, "serve", "--bg", "--https=443", f"http://127.0.0.1:{port}"],
+            capture_output=True, text=True)
+        out = (r.stdout or "") + (r.stderr or "")
+        if r.returncode != 0:
+            if "not enabled" in out.lower():
+                print("Tailscale Serve is not enabled on your tailnet.", file=sys.stderr)
+                print("Enable HTTPS Certificates in the admin console, then retry:",
+                      file=sys.stderr)
+                print("  https://login.tailscale.com/admin/dns", file=sys.stderr)
+            else:
+                print(out.strip() or "tailscale serve failed", file=sys.stderr)
+            if not lan:
+                sys.exit(1)
         else:
-            print(out.strip() or "tailscale serve failed", file=sys.stderr)
-        sys.exit(1)
+            url = _parse_serve_url(out) or _tailscale_https_url(ts)
 
-    # 3. Resolve the public URL and print client-ready details.
-    url = _parse_serve_url(out) or _tailscale_https_url(ts)
+    # 3. Print client-ready details.
     base = (url.rstrip("/") + "/v1") if url else None
+    lan_base = _lan_model_url(port) if lan else None
     mp = cfg.get("file") or cfg.get("model")
     model_id = os.path.basename(str(mp)) if mp else key
 
-    print("Serving over Tailscale:")
+    if lan:
+        print("\nServing on LAN:")
+        if lan_base:
+            print(f"  OpenAI: {lan_base}")
+            print(f"  Scan:   local-model scan --target {lan_base.split('//', 1)[1].split(':', 1)[0]} --ports {port}")
+        else:
+            print("  LAN IP could not be detected; use your machine's local IP.")
+        print("  Note:   allow inbound TCP for this port in the OS firewall.")
+
+    if url:
+        print("\nServing over Tailscale:")
+    elif not lan:
+        print("Serving over Tailscale:")
     if url:
         print(f"  URL:    {url.rstrip('/')}")
         print(f"  OpenAI: {base}")
     print(f"  Model:  {cfg.get('name', key)} (port {port})")
     print(f"  Health: {'OK' if check_health(port) else 'NOT READY'}")
-    if base:
+    client_base = base or lan_base
+    if client_base:
         print("\nPoint a remote client (Hermes / OpenClaw / any OpenAI SDK) at:")
-        print(f"  base_url = {base}")
+        print(f"  base_url = {client_base}")
         print(f"  model    = {model_id}")
         print("  api_key  = not-needed")
-    print(f"\nStop serving with: local-model serve {key} --off")
+    if url:
+        print(f"\nStop Tailscale serving with: local-model serve {key} --off")
+    if lan:
+        print(f"Stop the LAN model server with: local-model stop {key}")
 
 
 def cmd_config(args):
@@ -2769,7 +2835,7 @@ def cmd_help(args):
     print("Commands:")
     print(f"  {'list':<30} Show available models and their status")
     print(f"  {'start <model> [--ctx N]':<30} Start a model server")
-    print(f"  {'serve <model> [--off]':<30} Start + expose a model over Tailscale HTTPS")
+    print(f"  {'serve <model> [--lan]':<30} Start + expose a model over Tailscale/LAN")
     print(f"  {'stop <model|all>':<30} Stop a running model server")
     print(f"  {'status':<30} Show running servers with health info")
     print(f"  {'monitor [--once]':<30} Show RAM/VRAM attribution bars")
@@ -2815,6 +2881,7 @@ def main():
               local-model list                              Show all models and status
               local-model add hf:prism-ml/Ternary-Bonsai-8B-gguf   Download from HF
               local-model start bonsai                      Start a model server
+              local-model serve bonsai --lan                Expose on LAN + print scan target
               local-model stop all                          Stop all running servers
               local-model monitor --once                     Show RAM/VRAM attribution bars
               local-model scan --register                    Find and register LAN model servers
@@ -2835,9 +2902,11 @@ def main():
     p.add_argument("model", help="Model name or 'all'")
 
     p = sub.add_parser("serve",
-                       help="Start (if needed) and expose a model over Tailscale HTTPS")
+                       help="Start (if needed) and expose a model over Tailscale/LAN")
     p.add_argument("model", help="Model name")
     p.add_argument("--ctx", type=int, help="Override context window when starting")
+    p.add_argument("--lan", action="store_true",
+                   help="Bind to 0.0.0.0 and print the LAN OpenAI base URL")
     p.add_argument("--off", action="store_true",
                    help="Stop serving (remove the Tailscale HTTPS mapping)")
 
