@@ -13,6 +13,7 @@ Usage:
   local-model bench <model> [--ctx N]     Run speed benchmark
   local-model add <path|hf-repo> [name]   Register a new GGUF model
   local-model info <model>                Show model details (arch, params, quant, ctx)
+  local-model completion powershell       Print PowerShell tab completion setup
   local-model config                      Show / edit configuration
 """
 from __future__ import annotations
@@ -1209,6 +1210,22 @@ def _get_bench_speeds(key):
 
 
 # ── Commands ─────────────────────────────────────────────────────────────────
+
+MODEL_ARG_COMMANDS = {
+    "start", "serve", "stop", "test", "bench", "eval", "info", "edit", "sync-pi",
+}
+
+TOP_LEVEL_COMMANDS = [
+    "list", "start", "serve", "stop", "status", "monitor", "scan", "test",
+    "bench", "eval", "add", "add-remote", "info", "edit", "sync-pi",
+    "config", "completion", "help",
+]
+
+
+def _completion_matches(items, prefix):
+    prefix = (prefix or "").lower()
+    return [item for item in items if item.lower().startswith(prefix)]
+
 
 def cmd_list(args):
     registry = load_registry()
@@ -2950,6 +2967,65 @@ def cmd_config(args):
 
 # ── Help ────────────────────────────────────────────────────────────────────
 
+def cmd_complete(args):
+    prefix = args.prefix or ""
+    if args.kind == "commands":
+        for item in _completion_matches(TOP_LEVEL_COMMANDS, prefix):
+            print(item)
+        return
+
+    if args.kind == "models":
+        registry = load_registry()
+        items = sorted(registry)
+        if getattr(args, "include_all", False) and "all" not in items:
+            items = ["all"] + items
+        for item in _completion_matches(items, prefix):
+            print(item)
+        return
+
+
+def _powershell_completion_script():
+    commands = ", ".join(repr(c) for c in TOP_LEVEL_COMMANDS)
+    model_commands = ", ".join(repr(c) for c in sorted(MODEL_ARG_COMMANDS))
+    return f"""# local-model PowerShell tab completion
+# Add this to your PowerShell profile, or run:
+#   local-model completion powershell | Out-String | Invoke-Expression
+Register-ArgumentCompleter -Native -CommandName local-model -ScriptBlock {{
+    param($wordToComplete, $commandAst, $cursorPosition)
+
+    $commands = @({commands})
+    $modelCommands = @({model_commands})
+    $elements = @($commandAst.CommandElements | ForEach-Object {{
+        $_.Extent.Text
+    }})
+
+    if ($elements.Count -le 2) {{
+        local-model complete commands --prefix $wordToComplete 2>$null | ForEach-Object {{
+            [System.Management.Automation.CompletionResult]::new($_, $_, 'ParameterValue', $_)
+        }}
+        return
+    }}
+
+    $command = $elements[1]
+    if ($modelCommands -contains $command) {{
+        $extra = @()
+        if ($command -eq 'stop') {{ $extra = @('--include-all') }}
+        local-model complete models --prefix $wordToComplete @extra 2>$null | ForEach-Object {{
+            [System.Management.Automation.CompletionResult]::new($_, $_, 'ParameterValue', $_)
+        }}
+    }}
+}}
+"""
+
+
+def cmd_completion(args):
+    if args.shell == "powershell":
+        print(_powershell_completion_script())
+        return
+    print(f"Unsupported shell: {args.shell}", file=sys.stderr)
+    sys.exit(1)
+
+
 def cmd_help(args):
     print("local-model — manage local LLM inference servers\n")
 
@@ -2969,6 +3045,7 @@ def cmd_help(args):
     print(f"  {'edit <model> [--port N ...]':<30} Edit a model's name, port, context, runtime args")
     print(f"  {'add-remote <url> [name]':<30} Register a remote model (e.g. over Tailscale)")
     print(f"  {'sync-pi':<30} How to refresh pi after registry changes")
+    print(f"  {'completion powershell':<30} Print PowerShell tab completion setup")
     print(f"  {'config':<30} Show configuration and backend paths")
     print(f"  {'config --set-backend N path':<30} Configure a named backend binary")
     print(f"  {'help':<30} Show this help")
@@ -3098,6 +3175,14 @@ def main():
     p = sub.add_parser("sync-pi", help="How to refresh pi after registry changes (registry-driven)")
     p.add_argument("model", nargs="?", help="Model name (default: all registered)")
 
+    p = sub.add_parser("completion", help="Print shell completion setup")
+    p.add_argument("shell", choices=["powershell"], help="Shell to generate completion for")
+
+    p = sub.add_parser("complete", help=argparse.SUPPRESS)
+    p.add_argument("kind", choices=["commands", "models"])
+    p.add_argument("--prefix", default="")
+    p.add_argument("--include-all", action="store_true")
+
     p = sub.add_parser("config", help="Show / edit configuration")
     p.add_argument("--set-backend", nargs=2, metavar=("NAME", "PATH"),
                     help="Set a named backend binary path")
@@ -3128,6 +3213,8 @@ def main():
         "info": cmd_info,
         "edit": cmd_edit,
         "sync-pi": cmd_sync_pi,
+        "completion": cmd_completion,
+        "complete": cmd_complete,
         "config": cmd_config,
         "help": cmd_help,
     }

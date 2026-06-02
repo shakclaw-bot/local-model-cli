@@ -143,7 +143,18 @@ Example `bench` output:
 | `local-model test <model> [--prompts N]` | Quick quality smoke test (reasoning, coding, factual, creative) |
 | `local-model add <path\|hf:repo> [name]` | Register a GGUF model (local file or Hugging Face) |
 | `local-model info <model>` | Show model details, file size, GGUF metadata |
+| `local-model completion powershell` | Print PowerShell tab completion setup |
 | `local-model config [--set-backend N PATH]` | Show / edit configuration (home dir, backends, platform) |
+
+## Shell completion
+
+PowerShell tab completion can complete commands and registered model keys:
+
+```powershell
+local-model completion powershell | Out-String | Invoke-Expression
+```
+
+After loading it, typing `local-model start qw` and pressing Tab completes matching registered models such as `qwen3.6-35b`. Add the same line to your PowerShell profile (`$PROFILE`) to enable it in future terminals.
 
 ## Configuration
 
