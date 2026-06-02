@@ -1,0 +1,26 @@
+{
+  "name": "embed_repo",
+  "description": "Precompute and cache symbol embeddings for semantic search. Optional warm-up: search_symbols with semantic=true lazily embeds missing symbols on first use, but embed_repo warms the cache upfront so the first semantic query returns immediately. Requires an embedding provider (JCODEMUNCH_EMBED_MODEL, GOOGLE_API_KEY+GOOGLE_EMBED_MODEL, or OPENAI_API_KEY+OPENAI_EMBED_MODEL).",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "repo": {
+        "type": "string",
+        "description": "Repository identifier (owner/repo or just repo name)"
+      },
+      "batch_size": {
+        "type": "integer",
+        "description": "Symbols per embedding batch (default 50).",
+        "default": 50
+      },
+      "force": {
+        "type": "boolean",
+        "description": "Recompute all embeddings even if they already exist (default false).",
+        "default": false
+      }
+    },
+    "required": [
+      "repo"
+    ]
+  }
+}

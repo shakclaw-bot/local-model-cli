@@ -1,0 +1,36 @@
+{
+  "name": "get_call_hierarchy",
+  "description": "Return incoming callers and outgoing callees for a symbol, N levels deep. Uses AST-derived call detection: callers = symbols in importing files that mention this name; callees = imported symbols mentioned in this symbol's body. Useful for understanding how a symbol fits into the call graph before refactoring. For a 'what breaks if I delete this?' answer, use get_impact_preview instead.",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "repo": {
+        "type": "string",
+        "description": "Repository identifier (owner/repo or just repo name)"
+      },
+      "symbol_id": {
+        "type": "string",
+        "description": "Symbol name or full ID to analyse. Use search_symbols to find IDs."
+      },
+      "direction": {
+        "type": "string",
+        "enum": [
+          "callers",
+          "callees",
+          "both"
+        ],
+        "description": "'callers' = who calls this symbol; 'callees' = what this symbol calls; 'both' (default).",
+        "default": "both"
+      },
+      "depth": {
+        "type": "integer",
+        "description": "Maximum hops to traverse (1–5). Default 3.",
+        "default": 3
+      }
+    },
+    "required": [
+      "repo",
+      "symbol_id"
+    ]
+  }
+}

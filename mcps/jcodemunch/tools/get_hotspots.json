@@ -1,0 +1,31 @@
+{
+  "name": "get_hotspots",
+  "description": "Return the top-N highest-risk symbols ranked by hotspot score = cyclomatic_complexity x log(1 + commits_last_N_days). Identifies code that is both complex and frequently changed — the highest bug-introduction risk in the codebase. Methodology matches CodeScene/Adam Tornhill. Requires jcodemunch-mcp >= 1.16 for complexity data and a locally indexed repo for churn.",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "repo": {
+        "type": "string",
+        "description": "Repository identifier (owner/repo or just repo name)"
+      },
+      "top_n": {
+        "type": "integer",
+        "description": "Number of results to return (default 20).",
+        "default": 20
+      },
+      "days": {
+        "type": "integer",
+        "description": "Churn look-back window in days (default 90).",
+        "default": 90
+      },
+      "min_complexity": {
+        "type": "integer",
+        "description": "Minimum cyclomatic complexity to include (default 2).",
+        "default": 2
+      }
+    },
+    "required": [
+      "repo"
+    ]
+  }
+}

@@ -1,0 +1,34 @@
+{
+  "name": "get_symbol_importance",
+  "description": "Return the most architecturally important symbols in a repo, ranked by PageRank or in-degree centrality on the import graph. Useful for orientation: surfaces the symbols that most of the codebase depends on. New tool: use after indexing to understand repo architecture at a glance.",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "repo": {
+        "type": "string",
+        "description": "Repository identifier (owner/repo or just repo name)"
+      },
+      "top_n": {
+        "type": "integer",
+        "description": "Number of top symbols to return (default 20, max 200)",
+        "default": 20
+      },
+      "algorithm": {
+        "type": "string",
+        "enum": [
+          "pagerank",
+          "degree"
+        ],
+        "description": "'pagerank' (default) = full PageRank on import graph; 'degree' = simple in-degree count (faster).",
+        "default": "pagerank"
+      },
+      "scope": {
+        "type": "string",
+        "description": "Limit to a subdirectory prefix (e.g. 'src/core')"
+      }
+    },
+    "required": [
+      "repo"
+    ]
+  }
+}

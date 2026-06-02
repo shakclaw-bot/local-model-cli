@@ -1,0 +1,21 @@
+{
+  "name": "summarize_repo",
+  "description": "Re-run AI summarization on all symbols in an existing index. Use this when index_folder completed but AI summaries are missing — e.g., the background summarization thread was interrupted, AI was disabled at index time, or the summarizer provider wasn't configured yet. With force=true (recommended), clears all existing summaries and re-runs the full 3-tier pipeline (docstring → AI → signature fallback).",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "repo": {
+        "type": "string",
+        "description": "Repository identifier (owner/repo or local/hash)"
+      },
+      "force": {
+        "type": "boolean",
+        "description": "If true, clear all existing summaries and re-summarize every symbol. Required when index_folder already applied signature fallbacks. If false, only process symbols with no summary at all.",
+        "default": false
+      }
+    },
+    "required": [
+      "repo"
+    ]
+  }
+}

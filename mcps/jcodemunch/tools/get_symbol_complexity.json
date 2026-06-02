@@ -1,0 +1,21 @@
+{
+  "name": "get_symbol_complexity",
+  "description": "Return cyclomatic complexity, nesting depth, and parameter count for a single symbol. Complexity data is stored at index time (requires jcodemunch-mcp >= 1.16 / INDEX_VERSION 7). assessment field: 'low' (1-4), 'medium' (5-10), 'high' (11+). Re-index the repo if all metrics show 0 (pre-1.16 index).",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "repo": {
+        "type": "string",
+        "description": "Repository identifier (owner/repo or just repo name)"
+      },
+      "symbol_id": {
+        "type": "string",
+        "description": "Full symbol ID as returned by search_symbols or get_file_outline."
+      }
+    },
+    "required": [
+      "repo",
+      "symbol_id"
+    ]
+  }
+}

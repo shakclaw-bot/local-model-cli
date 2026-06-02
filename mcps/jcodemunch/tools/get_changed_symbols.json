@@ -1,0 +1,35 @@
+{
+  "name": "get_changed_symbols",
+  "description": "Map a git diff to affected symbols: given two commits, returns which symbols were added, removed, modified, or renamed. Useful after merging a PR to answer 'what actually changed?' for code review or regression triage. Requires a locally indexed repo (index_folder). Defaults to comparing current HEAD against the SHA stored at index time.",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "repo": {
+        "type": "string",
+        "description": "Repository identifier — must be locally indexed with index_folder"
+      },
+      "since_sha": {
+        "type": "string",
+        "description": "Compare from this git SHA or ref. Defaults to the SHA stored at index time."
+      },
+      "until_sha": {
+        "type": "string",
+        "description": "Compare to this git SHA or ref (default 'HEAD').",
+        "default": "HEAD"
+      },
+      "include_blast_radius": {
+        "type": "boolean",
+        "description": "Also return downstream importers (blast radius) for each changed symbol (default false).",
+        "default": false
+      },
+      "max_blast_depth": {
+        "type": "integer",
+        "description": "Hop limit when include_blast_radius=true (default 3, max 5).",
+        "default": 3
+      }
+    },
+    "required": [
+      "repo"
+    ]
+  }
+}

@@ -1,0 +1,37 @@
+{
+  "name": "check_references",
+  "description": "Check if an identifier is referenced anywhere: imports + file content. Combines find_references and search_text into one call. Returns is_referenced (bool) for quick dead-code detection. Accepts multiple identifiers in one call via identifiers param.",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "repo": {
+        "type": "string",
+        "description": "Repository identifier"
+      },
+      "identifier": {
+        "type": "string",
+        "description": "Single identifier to check"
+      },
+      "identifiers": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        },
+        "description": "Multiple identifiers to check in one call. Returns grouped results."
+      },
+      "search_content": {
+        "type": "boolean",
+        "default": true,
+        "description": "Also search file contents (not just imports). Set false for fast import-only check."
+      },
+      "max_content_results": {
+        "type": "integer",
+        "default": 20,
+        "description": "Max files to return per identifier for content search."
+      }
+    },
+    "required": [
+      "repo"
+    ]
+  }
+}

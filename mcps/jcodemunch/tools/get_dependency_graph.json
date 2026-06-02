@@ -1,0 +1,41 @@
+{
+  "name": "get_dependency_graph",
+  "description": "Get the file-level dependency graph for a given file. Traverses import relationships up to 3 hops. Use to understand what a file depends on ('imports'), what depends on it ('importers'), or both. Prerequisite for blast radius analysis. Set cross_repo=true to include cross-repository edges.",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "repo": {
+        "type": "string",
+        "description": "Repository identifier (owner/repo or just repo name)"
+      },
+      "file": {
+        "type": "string",
+        "description": "File path within the repo (e.g. 'src/server.py')"
+      },
+      "direction": {
+        "type": "string",
+        "description": "'imports' (files this file depends on), 'importers' (files that depend on this file), or 'both'",
+        "enum": [
+          "imports",
+          "importers",
+          "both"
+        ],
+        "default": "imports"
+      },
+      "depth": {
+        "type": "integer",
+        "description": "Number of hops to traverse (1–3)",
+        "default": 1
+      },
+      "cross_repo": {
+        "type": "boolean",
+        "description": "When true, include cross-repo edges (imports that resolve to packages in other indexed repos). Default: false.",
+        "default": false
+      }
+    },
+    "required": [
+      "repo",
+      "file"
+    ]
+  }
+}

@@ -1,0 +1,30 @@
+{
+  "name": "search_columns",
+  "description": "Search column metadata across indexed models. Works with any ecosystem provider that emits column data (dbt, SQLMesh, database catalogs, etc.). Returns model name, file path, column name, and description. Use instead of grep/search_text for column discovery — 77% fewer tokens.",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "repo": {
+        "type": "string",
+        "description": "Repository identifier (owner/repo or just repo name)"
+      },
+      "query": {
+        "type": "string",
+        "description": "Search query (matches column names and descriptions)"
+      },
+      "model_pattern": {
+        "type": "string",
+        "description": "Optional glob to filter by model name (e.g., 'fact_*', 'dim_provider')"
+      },
+      "max_results": {
+        "type": "integer",
+        "description": "Maximum number of results to return",
+        "default": 20
+      }
+    },
+    "required": [
+      "repo",
+      "query"
+    ]
+  }
+}

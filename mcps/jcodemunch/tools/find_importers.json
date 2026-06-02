@@ -1,0 +1,37 @@
+{
+  "name": "find_importers",
+  "description": "Find all files that import a given file. Answers 'what uses this file?'. has_importers=false on a result means that importer is itself unreachable (dead code chain). Supports dbt {{ ref() }} edges. Use file_paths for batch queries. Set cross_repo=true to also find importers in other indexed repos.",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "repo": {
+        "type": "string",
+        "description": "Repository identifier"
+      },
+      "file_path": {
+        "type": "string",
+        "description": "Target file path within the repo (e.g. 'src/features/intake/IntakeService.js'). Use for single-file queries. Cannot be used together with file_paths."
+      },
+      "file_paths": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        },
+        "description": "List of target file paths for batch queries. Returns a results array. Cannot be used together with file_path."
+      },
+      "max_results": {
+        "type": "integer",
+        "default": 50,
+        "description": "Maximum results per file"
+      },
+      "cross_repo": {
+        "type": "boolean",
+        "default": false,
+        "description": "When true, also search other indexed repos for cross-repo importers. Default: false (or JCODEMUNCH_CROSS_REPO_DEFAULT env var)."
+      }
+    },
+    "required": [
+      "repo"
+    ]
+  }
+}

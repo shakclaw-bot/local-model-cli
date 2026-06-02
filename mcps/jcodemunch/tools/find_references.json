@@ -1,0 +1,37 @@
+{
+  "name": "find_references",
+  "description": "Find all files that import or reference an identifier. Answers 'where is this used?'. Supports dbt {{ ref() }} edges. Use identifiers for batch queries. Set include_call_chain=true to also see which symbols in each file call the identifier.",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "repo": {
+        "type": "string",
+        "description": "Repository identifier"
+      },
+      "identifier": {
+        "type": "string",
+        "description": "Symbol or module name to search for (e.g. 'bulkImport', 'IntakeService'). Use for single-identifier queries. Cannot be used together with identifiers."
+      },
+      "identifiers": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        },
+        "description": "List of symbol or module names to search for (batch mode). Returns a results array. Cannot be used together with identifier."
+      },
+      "max_results": {
+        "type": "integer",
+        "default": 50,
+        "description": "Maximum results"
+      },
+      "include_call_chain": {
+        "type": "boolean",
+        "default": false,
+        "description": "When true (singular mode only), each reference entry includes calling_symbols: symbols in that file whose bodies mention the identifier. Default false."
+      }
+    },
+    "required": [
+      "repo"
+    ]
+  }
+}

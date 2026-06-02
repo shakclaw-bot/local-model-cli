@@ -1,0 +1,21 @@
+{
+  "name": "get_repo_health",
+  "description": "Return a one-call triage snapshot of the entire repository: symbol counts, dead code %, average cyclomatic complexity, top 5 hotspots, dependency cycle count, and unstable module count. Designed to be the first tool called in any new session — one call gives a complete picture to guide follow-up analysis.",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "repo": {
+        "type": "string",
+        "description": "Repository identifier (owner/repo or just repo name)"
+      },
+      "days": {
+        "type": "integer",
+        "description": "Churn look-back window for hotspot calculation (default 90).",
+        "default": 90
+      }
+    },
+    "required": [
+      "repo"
+    ]
+  }
+}

@@ -1,0 +1,41 @@
+{
+  "name": "get_symbol_source",
+  "description": "Get full source of one symbol (symbol_id → flat object) or many (symbol_ids[] → {symbols, errors}). Supports verify, context_lines, and fqn (PHP FQN via PSR-4).",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "repo": {
+        "type": "string",
+        "description": "Repository identifier (owner/repo or just repo name)"
+      },
+      "symbol_id": {
+        "type": "string",
+        "description": "Single symbol ID — returns flat symbol object"
+      },
+      "symbol_ids": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        },
+        "description": "Multiple symbol IDs — returns {symbols, errors}"
+      },
+      "verify": {
+        "type": "boolean",
+        "description": "Verify content hash matches stored hash (detects source drift)",
+        "default": false
+      },
+      "context_lines": {
+        "type": "integer",
+        "description": "Number of lines before/after symbol to include for context",
+        "default": 0
+      },
+      "fqn": {
+        "type": "string",
+        "description": "PHP fully-qualified class name (e.g. 'App\\Models\\User'). Resolves to symbol_id via PSR-4. Alternative to symbol_id."
+      }
+    },
+    "required": [
+      "repo"
+    ]
+  }
+}

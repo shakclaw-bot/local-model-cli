@@ -1,0 +1,8 @@
+{
+  "name": "list_repos",
+  "description": "List all indexed repositories. START HERE before using Grep/Read/search tools — check if the project is already indexed, then use search_symbols / get_symbol_source instead of native file reads. If jcodemunch tools appear as deferred in your tool list, call ToolSearch to load their schemas first.",
+  "inputSchema": {
+    "type": "object",
+    "properties": {}
+  }
+}

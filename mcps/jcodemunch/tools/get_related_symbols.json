@@ -1,0 +1,26 @@
+{
+  "name": "get_related_symbols",
+  "description": "Find symbols related to a given symbol using heuristic clustering: same-file co-location (weight 3), shared importers (weight 1.5), and name-token overlap (weight 0.5/token). Useful for discovering what else to read when exploring an unfamiliar codebase.",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "repo": {
+        "type": "string",
+        "description": "Repository identifier (owner/repo or just repo name)"
+      },
+      "symbol_id": {
+        "type": "string",
+        "description": "ID of the symbol to find relatives for"
+      },
+      "max_results": {
+        "type": "integer",
+        "description": "Maximum results (default 10, max 50)",
+        "default": 10
+      }
+    },
+    "required": [
+      "repo",
+      "symbol_id"
+    ]
+  }
+}

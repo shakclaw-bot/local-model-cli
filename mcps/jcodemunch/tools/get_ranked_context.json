@@ -1,0 +1,47 @@
+{
+  "name": "get_ranked_context",
+  "description": "Assemble the best-fit context for a query within a token budget. Ranks all symbols by relevance (BM25) and/or centrality (PageRank), loads source for the top candidates, and packs greedily until token_budget is exhausted. Use when you want 'the best N tokens of context for this task' without specifying exact symbols.",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "repo": {
+        "type": "string",
+        "description": "Repository identifier (owner/repo or just repo name)"
+      },
+      "query": {
+        "type": "string",
+        "description": "Natural language or identifier describing the task (max 500 chars)"
+      },
+      "token_budget": {
+        "type": "integer",
+        "description": "Hard cap on returned tokens (default 4000).",
+        "default": 4000
+      },
+      "strategy": {
+        "type": "string",
+        "enum": [
+          "combined",
+          "bm25",
+          "centrality"
+        ],
+        "description": "'combined' (default) = BM25 + PageRank weighted sum. 'bm25' = pure text relevance. 'centrality' = PageRank only, filtered to query-matching symbols.",
+        "default": "combined"
+      },
+      "include_kinds": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        },
+        "description": "Optional list of symbol kinds to restrict results (e.g. ['class', 'function'])."
+      },
+      "scope": {
+        "type": "string",
+        "description": "Optional glob pattern to limit search to a subdirectory (e.g. 'src/core/*')."
+      }
+    },
+    "required": [
+      "repo",
+      "query"
+    ]
+  }
+}
