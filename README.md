@@ -247,17 +247,19 @@ local-model edit gemma4
 ```bash
 local-model scan
 local-model scan --target 100.64.0.0/24 --ports 8080,8000,11434
+local-model scan --target 192.168.1.25:8080
 local-model scan --register
 ```
 
 When models are found, an interactive terminal shows a selectable list:
 
 ```text
-[ ]  1. qwen3.6-35b  @  http://192.168.1.25:8080/v1
-[>] Add selected models
+Discovered models (Up/Down, Space to select, Enter to add, q to cancel):
+  > [ ]  1. qwen3.6-35b  @  http://192.168.1.25:8080/v1
+    [>] Add selected models
 ```
 
-Pick the model numbers to add them to `~/.local-model/registry.json`. Use `--register` to add every discovered model without prompting. Remote models appear in `local-model list` as `online`, `offline`, or `connected`.
+Use Up/Down to move, Space to tick models, then Enter on `Add selected models` to add them to `~/.local-model/registry.json`. Use `--register` to add every discovered model without prompting. Remote models appear in `local-model list` as `online`, `offline`, or `connected`.
 
 To make a local model discoverable from another machine on your LAN, serve it with `--lan`:
 
@@ -267,7 +269,7 @@ local-model serve bonsai --lan
 # prints, for example: http://192.168.1.25:8080/v1
 
 # On the laptop:
-local-model scan --target 192.168.1.25 --ports 8080
+local-model scan --target 192.168.1.25:8080
 local-model start qwen3.6-35b
 ```
 
