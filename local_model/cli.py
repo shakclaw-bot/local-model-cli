@@ -2975,9 +2975,10 @@ def cmd_serve(args):
         sys.exit(1)
 
     lan = getattr(args, "lan", False)
+    use_tailscale = (not lan) or getattr(args, "tailscale", False)
     port = cfg.get("port", 8080)
     ts = _tailscale_bin()
-    if not ts and not lan:
+    if use_tailscale and not ts:
         print("tailscale CLI not found.", file=sys.stderr)
         print("Install Tailscale and sign in, then retry.", file=sys.stderr)
         sys.exit(1)
@@ -3012,9 +3013,9 @@ def cmd_serve(args):
         cmd_start(args)
 
     # 2. Map the device's :443 to the local model port over Tailscale when
-    #    available. --lan can be used on machines without Tailscale installed.
+    #    requested. --lan alone is LAN-only.
     url = None
-    if ts:
+    if use_tailscale and ts:
         print(f"\nExposing port {port} over Tailscale (HTTPS)...")
         r = subprocess.run(
             [ts, "serve", "--bg", "--https=443", f"http://127.0.0.1:{port}"],
@@ -3028,7 +3029,7 @@ def cmd_serve(args):
                 print("  https://login.tailscale.com/admin/dns", file=sys.stderr)
             else:
                 print(out.strip() or "tailscale serve failed", file=sys.stderr)
-            if not lan:
+            if use_tailscale and not lan:
                 sys.exit(1)
         else:
             url = _parse_serve_url(out) or _tailscale_https_url(ts)
@@ -3057,7 +3058,7 @@ def cmd_serve(args):
         print(f"  OpenAI: {base}")
     print(f"  Model:  {cfg.get('name', key)} (port {port})")
     print(f"  Health: {'OK' if check_health(port) else 'NOT READY'}")
-    client_base = base or lan_base
+    client_base = lan_base if lan else base
     if client_base:
         print("\nPoint a remote client (Hermes / OpenClaw / any OpenAI SDK) at:")
         print(f"  base_url = {client_base}")
@@ -3308,6 +3309,8 @@ def main():
     p.add_argument("--ctx", type=int, help="Override context window when starting")
     p.add_argument("--lan", action="store_true",
                    help="Bind to 0.0.0.0 and print the LAN OpenAI base URL")
+    p.add_argument("--tailscale", action="store_true",
+                   help="Also expose over Tailscale when using --lan")
     p.add_argument("--off", action="store_true",
                    help="Stop serving (remove the Tailscale HTTPS mapping)")
 

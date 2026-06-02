@@ -273,7 +273,7 @@ local-model scan --target 192.168.1.25:8080
 local-model start qwen3.6-35b
 ```
 
-`local-model start` on a remote model connects to the endpoint and prints the `base_url`, `model`, and `api_key` values to point a Pi agent or any OpenAI-compatible client at the desktop. `--lan` binds the model server to `0.0.0.0`; allow inbound TCP for the model port in your OS firewall if another device cannot reach it.
+`local-model start` on a remote model connects to the endpoint and prints the `base_url`, `model`, and `api_key` values to point a Pi agent or any OpenAI-compatible client at the desktop. `--lan` binds the model server to `0.0.0.0` and stays LAN-only; add `--tailscale` if you want both LAN and Tailscale exposure. Allow inbound TCP for the model port in your OS firewall if another device cannot reach it.
 
 ## VRAM auto-sizing for MoE models (`auto_ncmoe`)
 
