@@ -253,11 +253,12 @@ local-model scan --register
 When models are found, an interactive terminal shows a selectable list:
 
 ```text
-[ ]  1. qwen3.6-35b  @  http://192.168.1.25:8080/v1
-[>] Add selected models
+Discovered models (Up/Down, Space to select, Enter to add, q to cancel):
+  > [ ]  1. qwen3.6-35b  @  http://192.168.1.25:8080/v1
+    [>] Add selected models
 ```
 
-Pick the model numbers to add them to `~/.local-model/registry.json`. Use `--register` to add every discovered model without prompting. Remote models appear in `local-model list` as `online`, `offline`, or `connected`.
+Use Up/Down to move, Space to tick models, then Enter on `Add selected models` to add them to `~/.local-model/registry.json`. Use `--register` to add every discovered model without prompting. Remote models appear in `local-model list` as `online`, `offline`, or `connected`.
 
 To make a local model discoverable from another machine on your LAN, serve it with `--lan`:
 

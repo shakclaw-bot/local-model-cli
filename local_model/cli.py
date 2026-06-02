@@ -2674,6 +2674,111 @@ def _register_remote_choice(registry, choice, context):
     return key
 
 
+def _read_scan_key():
+    if os.name == "nt":
+        import msvcrt
+        ch = msvcrt.getwch()
+        if ch in ("\x00", "\xe0"):
+            ch = msvcrt.getwch()
+            return {"H": "up", "P": "down"}.get(ch, "")
+        return {
+            "\r": "enter",
+            " ": "space",
+            "\x1b": "cancel",
+            "\x03": "interrupt",
+        }.get(ch, ch.lower())
+
+    import termios, tty
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd)
+        ch = sys.stdin.read(1)
+        if ch == "\x1b":
+            seq = sys.stdin.read(2)
+            if seq == "[A":
+                return "up"
+            if seq == "[B":
+                return "down"
+            return "cancel"
+        return {
+            "\r": "enter",
+            "\n": "enter",
+            " ": "space",
+            "\x03": "interrupt",
+        }.get(ch, ch.lower())
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+
+def _render_scan_picker(choices, existing, selected, cursor, previous_lines=0):
+    lines = ["Discovered models (Up/Down, Space to select, Enter to add, q to cancel):"]
+    for i, choice in enumerate(choices):
+        identity = (choice["url"], choice["model"])
+        active = ">" if cursor == i else " "
+        checked = "x" if i in selected or identity in existing else " "
+        suffix = " (already added)" if identity in existing else ""
+        lines.append(
+            f"  {active} [{checked}] {i + 1:>2}. {choice['model']}  @  {choice['url']}{suffix}"
+        )
+    active = ">" if cursor == len(choices) else " "
+    lines.append(f"  {active} [>] Add selected models")
+
+    if previous_lines:
+        sys.stdout.write(f"\033[{previous_lines}A")
+    for line in lines:
+        sys.stdout.write("\r\033[K" + line + "\n")
+    sys.stdout.flush()
+    return len(lines)
+
+
+def _interactive_scan_selection(choices, existing):
+    if not choices:
+        return []
+
+    selected = set()
+    cursor = 0
+    line_count = 0
+    sys.stdout.write("\033[?25l")
+    try:
+        while True:
+            line_count = _render_scan_picker(choices, existing, selected, cursor, line_count)
+            key = _read_scan_key()
+            if key == "interrupt":
+                raise KeyboardInterrupt
+            if key in ("cancel", "q"):
+                return []
+            if key == "up":
+                cursor = (cursor - 1) % (len(choices) + 1)
+            elif key == "down":
+                cursor = (cursor + 1) % (len(choices) + 1)
+            elif key == "space" and cursor < len(choices):
+                identity = (choices[cursor]["url"], choices[cursor]["model"])
+                if identity not in existing:
+                    if cursor in selected:
+                        selected.remove(cursor)
+                    else:
+                        selected.add(cursor)
+            elif key == "a":
+                available = {
+                    i for i, choice in enumerate(choices)
+                    if (choice["url"], choice["model"]) not in existing
+                }
+                selected = set() if selected == available else available
+            elif key == "enter":
+                if cursor == len(choices):
+                    return sorted(selected)
+                identity = (choices[cursor]["url"], choices[cursor]["model"])
+                if identity not in existing:
+                    if cursor in selected:
+                        selected.remove(cursor)
+                    else:
+                        selected.add(cursor)
+    finally:
+        sys.stdout.write("\033[?25h")
+        sys.stdout.flush()
+
+
 def cmd_scan(args):
     try:
         ports = _parse_port_list(args.ports)
@@ -2741,18 +2846,12 @@ def cmd_scan(args):
     if args.register:
         selected_indexes = list(range(len(choices)))
     elif sys.stdin.isatty():
-        print("\nDiscovered models:")
-        for i, choice in enumerate(choices, 1):
-            mark = "x" if (choice["url"], choice["model"]) in existing else " "
-            suffix = " (already added)" if mark == "x" else ""
-            print(f"  [{mark}] {i:>2}. {choice['model']}  @  {choice['url']}{suffix}")
-        print("  [>] Add selected models")
         try:
-            answer = input("\nSelect models to add (1,3-5 or all; Enter skips): ")
-            selected_indexes = _parse_selection(answer, len(choices))
-        except ValueError as exc:
-            print(f"scan: {exc}", file=sys.stderr)
-            sys.exit(1)
+            print()
+            selected_indexes = _interactive_scan_selection(choices, existing)
+        except KeyboardInterrupt:
+            print("\nscan: cancelled", file=sys.stderr)
+            sys.exit(130)
     else:
         print("\nRegister discovered models with: local-model scan --register")
 
