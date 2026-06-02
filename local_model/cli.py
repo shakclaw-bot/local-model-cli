@@ -4,6 +4,7 @@
 Usage:
   local-model list                        Show available models and their status
   local-model start <model> [--ctx N]     Start a model server
+  local-model serve <model> [--lan]       Expose a model over Tailscale/LAN
   local-model stop <model|all>            Stop a running model server
   local-model status                      Show running servers with health + memory
   local-model monitor                     Show RAM/VRAM attribution bars
@@ -12,6 +13,7 @@ Usage:
   local-model bench <model> [--ctx N]     Run speed benchmark
   local-model add <path|hf-repo> [name]   Register a new GGUF model
   local-model info <model>                Show model details (arch, params, quant, ctx)
+  local-model completion powershell       Print PowerShell tab completion setup
   local-model config                      Show / edit configuration
 """
 from __future__ import annotations
@@ -260,6 +262,33 @@ def _check_endpoint(cfg, timeout=5):
         return False
 
 
+def _remote_model_id(cfg, key=None):
+    for field in ("model", "model_id", "id"):
+        if cfg.get(field):
+            return str(cfg[field])
+    models = cfg.get("models")
+    if isinstance(models, list) and models:
+        return str(models[0])
+    return cfg.get("name") or key or "remote"
+
+
+def _connected_remote():
+    connected = _load_config().get("connected_remote")
+    return connected if isinstance(connected, dict) else {}
+
+
+def _set_connected_remote(key, cfg):
+    config = _load_config()
+    config["connected_remote"] = {
+        "key": key,
+        "name": cfg.get("name", key),
+        "url": _model_endpoint(cfg),
+        "model": _remote_model_id(cfg, key),
+        "connected_at": int(time.time()),
+    }
+    _save_config(config)
+
+
 def _normalize_remote_url(u):
     """Accept host:port or a full URL; normalize to a .../v1 base URL."""
     u = u.strip().rstrip("/")
@@ -301,17 +330,22 @@ def _parse_port_list(text):
 
 
 def _local_lan_cidr():
+    host = _local_ip_address()
+    if host and not host.startswith("127."):
+        return f"{host}/24"
+    return None
+
+
+def _local_ip_address():
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
             s.connect(("8.8.8.8", 80))
-            host = s.getsockname()[0]
+            return s.getsockname()[0]
         finally:
             s.close()
-        if host and not host.startswith("127."):
-            return f"{host}/24"
     except Exception:
-        pass
+        return None
     return None
 
 
@@ -392,6 +426,20 @@ def _unique_key(registry, base_key):
         key = f"{base_key}-{i}"
         i += 1
     return key
+
+
+def _lan_model_url(port):
+    lan_ip = _local_ip_address()
+    if not lan_ip or lan_ip.startswith("127."):
+        return None
+    return f"http://{lan_ip}:{port}/v1"
+
+
+def _check_lan_endpoint(port, timeout=1.0):
+    url = _lan_model_url(port)
+    if not url:
+        return False
+    return bool(_models_from_payload(_http_json(url + "/models", timeout=timeout)))
 
 
 def check_health(port, timeout=3):
@@ -1078,7 +1126,15 @@ def _compute_ncmoe(cfg, ctx, quiet=False):
     return ncmoe
 
 
-def _build_server_cmd(cfg, binary, model_path, port, ctx):
+def _server_host(cfg, args=None):
+    if getattr(args, "lan", False):
+        return "0.0.0.0"
+    if getattr(args, "host", None):
+        return args.host
+    return cfg.get("host", "127.0.0.1")
+
+
+def _build_server_cmd(cfg, binary, model_path, port, ctx, host="127.0.0.1"):
     cmd = [
         binary, "-m", model_path,
         "-ngl", str(cfg.get("gpu_layers", 99)),
@@ -1088,7 +1144,7 @@ def _build_server_cmd(cfg, binary, model_path, port, ctx):
         "-ctv", cfg.get("cache_v", "f16"),
         "--threads", str(cfg.get("threads", 4)),
         "-np", "1",
-        "--host", "127.0.0.1",
+        "--host", host,
         "--port", str(port),
     ]
     mmproj = cfg.get("mmproj")
@@ -1155,8 +1211,25 @@ def _get_bench_speeds(key):
 
 # ── Commands ─────────────────────────────────────────────────────────────────
 
+MODEL_ARG_COMMANDS = {
+    "start", "serve", "stop", "test", "bench", "eval", "info", "edit", "sync-pi",
+}
+
+TOP_LEVEL_COMMANDS = [
+    "list", "start", "serve", "stop", "status", "monitor", "scan", "test",
+    "bench", "eval", "add", "add-remote", "info", "edit", "sync-pi",
+    "config", "completion", "help",
+]
+
+
+def _completion_matches(items, prefix):
+    prefix = (prefix or "").lower()
+    return [item for item in items if item.lower().startswith(prefix)]
+
+
 def cmd_list(args):
     registry = load_registry()
+    connected = _connected_remote()
     processes = _process_snapshots()
     external = _external_rows(processes)
     if not registry and not external:
@@ -1181,8 +1254,12 @@ def cmd_list(args):
 
         if _is_remote(cfg):
             reachable = _check_endpoint(cfg)
-            status = ("\033[36mremote ok\033[0m" if reachable
-                      else "\033[31mremote down\033[0m")
+            if connected.get("key") == key and reachable:
+                status = "\033[32mconnected\033[0m"
+            elif reachable:
+                status = "\033[36monline\033[0m"
+            else:
+                status = "\033[31moffline\033[0m"
             rows.append([key, "local-model", "llm", cfg.get("name", "?"),
                          "remote", ctx_str, "-", "-", "-", status])
             continue
@@ -1251,20 +1328,26 @@ def cmd_start(args):
 
     if _is_remote(cfg):
         base = _model_endpoint(cfg)
-        print(f"{cfg.get('name', key)} is a remote model (not started locally).")
+        model_id = _remote_model_id(cfg, key)
+        print(f"{cfg.get('name', key)} is a remote model.")
         print(f"  endpoint: {base}")
         if _check_endpoint(cfg):
-            print("  status:   reachable")
+            _set_connected_remote(key, cfg)
+            print("  status:   connected")
             print(f"\nPoint your client (Hermes / OpenClaw / any OpenAI SDK) at:")
-            print(f"  {base}")
+            print(f"  base_url = {base}")
+            print(f"  model    = {model_id}")
+            print("  api_key  = not-needed")
         else:
-            print("  status:   NOT reachable", file=sys.stderr)
-            print("  (is the remote host's model running and Tailscale up?)",
+            print("  status:   offline", file=sys.stderr)
+            print("  (is the remote host serving the model, and is the network path up?)",
                   file=sys.stderr)
             sys.exit(1)
         return
 
     pid = get_running_pid(key)
+    host = _server_host(cfg, args)
+
     if pid and check_health(cfg["port"]):
         print(f"{cfg['name']} is already running on port {cfg['port']} (PID {pid})")
         return
@@ -1290,11 +1373,11 @@ def cmd_start(args):
         sys.exit(1)
 
     ctx = args.ctx or cfg.get("context", 8192)
-    cmd = _build_server_cmd(cfg, binary, model_path, port, ctx)
+    cmd = _build_server_cmd(cfg, binary, model_path, port, ctx, host)
 
     log_f = log_file_for(key)
     print(f"Starting {cfg['name']}...")
-    print(f"  port: {port}  ctx: {ctx}  {_describe_config(cfg)}")
+    print(f"  host: {host}  port: {port}  ctx: {ctx}  {_describe_config(cfg)}")
 
     with open(log_f, "w") as lf:
         proc = subprocess.Popen(cmd, stdout=lf, stderr=subprocess.STDOUT)
@@ -1313,6 +1396,10 @@ def cmd_start(args):
             elapsed = time.monotonic() - t0
             print(f" ready ({elapsed:.0f}s)")
             print(f"\n{cfg['name']} is running on port {port}.")
+            if host == "0.0.0.0":
+                lan_ip = _local_ip_address()
+                if lan_ip:
+                    print(f"  LAN: http://{lan_ip}:{port}/v1")
             return
         time.sleep(1)
         print(".", end="", flush=True)
@@ -1348,15 +1435,21 @@ def cmd_stop(args):
 
 def cmd_status(args):
     registry = load_registry()
+    connected = _connected_remote()
     found = False
 
     for key, cfg in sorted(registry.items()):
         if _is_remote(cfg):
             found = True
             base = _model_endpoint(cfg)
+            reachable = _check_endpoint(cfg)
+            state = "connected" if connected.get("key") == key and reachable else (
+                "online" if reachable else "offline"
+            )
             print(f"\n{cfg.get('name', key)}  [remote]")
             print(f"  Endpoint: {base}")
-            print(f"  Health:   {'OK' if _check_endpoint(cfg) else 'UNREACHABLE'}")
+            print(f"  Model:    {_remote_model_id(cfg, key)}")
+            print(f"  Status:   {state}")
             continue
         pid = get_running_pid(key)
         if not pid:
@@ -2516,6 +2609,71 @@ def cmd_add_remote(args):
     print(f"Use it by pointing your client at: {url}")
 
 
+def _remote_registry_identity(cfg):
+    if not (_is_remote(cfg) and cfg.get("url")):
+        return None
+    return (_normalize_remote_url(cfg["url"]), _remote_model_id(cfg))
+
+
+def _scan_choices(found):
+    choices = []
+    for item in found:
+        for model_id in item["models"]:
+            choices.append({
+                "host": item["host"],
+                "port": item["port"],
+                "url": _normalize_remote_url(item["url"]),
+                "model": model_id,
+            })
+    return choices
+
+
+def _parse_selection(text, count):
+    text = (text or "").strip().lower()
+    if not text:
+        return []
+    if text in ("a", "all"):
+        return list(range(count))
+    selected = set()
+    for part in text.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            start, _, end = part.partition("-")
+            try:
+                first, last = int(start), int(end)
+            except ValueError:
+                raise ValueError(f"invalid selection '{part}'")
+            if first > last:
+                first, last = last, first
+            nums = range(first, last + 1)
+        else:
+            try:
+                nums = [int(part)]
+            except ValueError:
+                raise ValueError(f"invalid selection '{part}'")
+        for num in nums:
+            if num < 1 or num > count:
+                raise ValueError(f"selection out of range: {num}")
+            selected.add(num - 1)
+    return sorted(selected)
+
+
+def _register_remote_choice(registry, choice, context):
+    key = _unique_key(registry, _safe_key(choice["model"]))
+    registry[key] = {
+        "name": choice["model"],
+        "remote": True,
+        "url": choice["url"],
+        "model": choice["model"],
+        "context": context,
+        "models": [choice["model"]],
+        "notes": f"Discovered by network scan at {choice['host']}:{choice['port']}",
+    }
+    return key
+
+
 def cmd_scan(args):
     try:
         ports = _parse_port_list(args.ports)
@@ -2563,13 +2721,13 @@ def cmd_scan(args):
         print("No OpenAI-compatible model endpoints found.")
         return
 
+    choices = _scan_choices(found)
     registry = load_registry()
-    existing_urls = {
-        _normalize_remote_url(cfg.get("url", ""))
-        for cfg in registry.values()
-        if _is_remote(cfg) and cfg.get("url")
+    existing = {
+        identity for identity in (_remote_registry_identity(cfg)
+                                 for cfg in registry.values())
+        if identity
     }
-    registered = []
 
     print(f"\n{'Endpoint':<28} {'Models'}")
     print("-" * 80)
@@ -2579,37 +2737,51 @@ def cmd_scan(args):
             models += f", +{len(item['models']) - 4} more"
         print(f"{item['url']:<28} {models}")
 
-        if not args.register:
-            continue
-
-        url = _normalize_remote_url(item["url"])
-        if url in existing_urls:
-            registered.append((url, "already registered"))
-            continue
-        model_name = item["models"][0] if item["models"] else f"{item['host']}:{item['port']}"
-        key = _unique_key(registry, _safe_key(model_name))
-        registry[key] = {
-            "name": model_name,
-            "remote": True,
-            "url": url,
-            "context": args.context,
-            "models": item["models"],
-            "notes": f"Discovered by network scan at {item['host']}:{item['port']}",
-        }
-        existing_urls.add(url)
-        registered.append((url, key))
-
+    selected_indexes = []
     if args.register:
-        if any(key != "already registered" for _url, key in registered):
-            save_registry(registry)
-        print("\nRegistration:")
-        for url, key in registered:
-            if key == "already registered":
-                print(f"  {url}: already registered")
-            else:
-                print(f"  {url}: registered as '{key}'")
+        selected_indexes = list(range(len(choices)))
+    elif sys.stdin.isatty():
+        print("\nDiscovered models:")
+        for i, choice in enumerate(choices, 1):
+            mark = "x" if (choice["url"], choice["model"]) in existing else " "
+            suffix = " (already added)" if mark == "x" else ""
+            print(f"  [{mark}] {i:>2}. {choice['model']}  @  {choice['url']}{suffix}")
+        print("  [>] Add selected models")
+        try:
+            answer = input("\nSelect models to add (1,3-5 or all; Enter skips): ")
+            selected_indexes = _parse_selection(answer, len(choices))
+        except ValueError as exc:
+            print(f"scan: {exc}", file=sys.stderr)
+            sys.exit(1)
     else:
-        print("\nRegister discovered endpoints with: local-model scan --register")
+        print("\nRegister discovered models with: local-model scan --register")
+
+    if not selected_indexes:
+        return
+
+    registered = []
+    for idx in selected_indexes:
+        choice = choices[idx]
+        identity = (choice["url"], choice["model"])
+        if identity in existing:
+            registered.append((choice["model"], choice["url"], "already registered"))
+            continue
+        key = _register_remote_choice(registry, choice, args.context)
+        existing.add(identity)
+        registered.append((choice["model"], choice["url"], key))
+
+    if any(key != "already registered" for _model, _url, key in registered):
+        save_registry(registry)
+    print("\nRegistration:")
+    for model, url, key in registered:
+        if key == "already registered":
+            print(f"  {model} @ {url}: already registered")
+        else:
+            print(f"  {model} @ {url}: registered as '{key}'")
+    print("\nConnect with:")
+    for _model, _url, key in registered:
+        if key != "already registered":
+            print(f"  local-model start {key}")
 
 
 def _tailscale_bin():
@@ -2643,7 +2815,7 @@ def _tailscale_https_url(ts):
 
 
 def cmd_serve(args):
-    """Expose a local model over Tailscale HTTPS, starting it first if needed."""
+    """Expose a local model over Tailscale HTTPS and/or the LAN."""
     _ensure_dirs()
     registry = load_registry()
     key = get_model_key(registry, args.model)
@@ -2654,15 +2826,19 @@ def cmd_serve(args):
               file=sys.stderr)
         sys.exit(1)
 
+    lan = getattr(args, "lan", False)
     port = cfg.get("port", 8080)
     ts = _tailscale_bin()
-    if not ts:
+    if not ts and not lan:
         print("tailscale CLI not found.", file=sys.stderr)
         print("Install Tailscale and sign in, then retry.", file=sys.stderr)
         sys.exit(1)
 
     # --off: remove the proxy mapping and exit.
     if getattr(args, "off", False):
+        if not ts:
+            print("tailscale CLI not found.", file=sys.stderr)
+            sys.exit(1)
         r = subprocess.run([ts, "serve", "--https=443", "off"],
                            capture_output=True, text=True)
         if r.returncode == 0:
@@ -2673,48 +2849,76 @@ def cmd_serve(args):
             sys.exit(1)
         return
 
-    # 1. Ensure the model is up. cmd_start reports the already-running case and
-    #    exits non-zero on failure (which aborts serve too).
+    # 1. Ensure the model is up. For LAN serving, restart a localhost-bound
+    #    process so llama-server listens on 0.0.0.0.
     pid = get_running_pid(key)
+    if lan and pid and check_health(port) and not _check_lan_endpoint(port):
+        print(f"{cfg.get('name', key)} is running on localhost; restarting for LAN...")
+        _terminate_pid(pid)
+        time.sleep(2)
+        pid = None
+
     if pid and check_health(port):
         print(f"{cfg.get('name', key)} already running on port {port} (PID {pid}).")
     else:
         cmd_start(args)
 
-    # 2. Map the device's :443 to the local model port over Tailscale.
-    print(f"\nExposing port {port} over Tailscale (HTTPS)...")
-    r = subprocess.run(
-        [ts, "serve", "--bg", "--https=443", f"http://127.0.0.1:{port}"],
-        capture_output=True, text=True)
-    out = (r.stdout or "") + (r.stderr or "")
-    if r.returncode != 0:
-        if "not enabled" in out.lower():
-            print("Tailscale Serve is not enabled on your tailnet.", file=sys.stderr)
-            print("Enable HTTPS Certificates in the admin console, then retry:",
-                  file=sys.stderr)
-            print("  https://login.tailscale.com/admin/dns", file=sys.stderr)
+    # 2. Map the device's :443 to the local model port over Tailscale when
+    #    available. --lan can be used on machines without Tailscale installed.
+    url = None
+    if ts:
+        print(f"\nExposing port {port} over Tailscale (HTTPS)...")
+        r = subprocess.run(
+            [ts, "serve", "--bg", "--https=443", f"http://127.0.0.1:{port}"],
+            capture_output=True, text=True)
+        out = (r.stdout or "") + (r.stderr or "")
+        if r.returncode != 0:
+            if "not enabled" in out.lower():
+                print("Tailscale Serve is not enabled on your tailnet.", file=sys.stderr)
+                print("Enable HTTPS Certificates in the admin console, then retry:",
+                      file=sys.stderr)
+                print("  https://login.tailscale.com/admin/dns", file=sys.stderr)
+            else:
+                print(out.strip() or "tailscale serve failed", file=sys.stderr)
+            if not lan:
+                sys.exit(1)
         else:
-            print(out.strip() or "tailscale serve failed", file=sys.stderr)
-        sys.exit(1)
+            url = _parse_serve_url(out) or _tailscale_https_url(ts)
 
-    # 3. Resolve the public URL and print client-ready details.
-    url = _parse_serve_url(out) or _tailscale_https_url(ts)
+    # 3. Print client-ready details.
     base = (url.rstrip("/") + "/v1") if url else None
+    lan_base = _lan_model_url(port) if lan else None
     mp = cfg.get("file") or cfg.get("model")
     model_id = os.path.basename(str(mp)) if mp else key
 
-    print("Serving over Tailscale:")
+    if lan:
+        print("\nServing on LAN:")
+        if lan_base:
+            print(f"  OpenAI: {lan_base}")
+            print(f"  Scan:   local-model scan --target {lan_base.split('//', 1)[1].split(':', 1)[0]} --ports {port}")
+        else:
+            print("  LAN IP could not be detected; use your machine's local IP.")
+        print("  Note:   allow inbound TCP for this port in the OS firewall.")
+
+    if url:
+        print("\nServing over Tailscale:")
+    elif not lan:
+        print("Serving over Tailscale:")
     if url:
         print(f"  URL:    {url.rstrip('/')}")
         print(f"  OpenAI: {base}")
     print(f"  Model:  {cfg.get('name', key)} (port {port})")
     print(f"  Health: {'OK' if check_health(port) else 'NOT READY'}")
-    if base:
+    client_base = base or lan_base
+    if client_base:
         print("\nPoint a remote client (Hermes / OpenClaw / any OpenAI SDK) at:")
-        print(f"  base_url = {base}")
+        print(f"  base_url = {client_base}")
         print(f"  model    = {model_id}")
         print("  api_key  = not-needed")
-    print(f"\nStop serving with: local-model serve {key} --off")
+    if url:
+        print(f"\nStop Tailscale serving with: local-model serve {key} --off")
+    if lan:
+        print(f"Stop the LAN model server with: local-model stop {key}")
 
 
 def cmd_config(args):
@@ -2763,13 +2967,127 @@ def cmd_config(args):
 
 # ── Help ────────────────────────────────────────────────────────────────────
 
+def cmd_complete(args):
+    prefix = args.prefix or ""
+    if args.kind == "commands":
+        for item in _completion_matches(TOP_LEVEL_COMMANDS, prefix):
+            print(item)
+        return
+
+    if args.kind == "models":
+        registry = load_registry()
+        items = sorted(registry)
+        if getattr(args, "include_all", False) and "all" not in items:
+            items = ["all"] + items
+        for item in _completion_matches(items, prefix):
+            print(item)
+        return
+
+
+def _powershell_completion_script():
+    commands = ", ".join(repr(c) for c in TOP_LEVEL_COMMANDS)
+    model_commands = ", ".join(repr(c) for c in sorted(MODEL_ARG_COMMANDS))
+    return f"""# local-model PowerShell tab completion
+# Add this to your PowerShell profile, or run:
+#   local-model completion powershell | Out-String | Invoke-Expression
+Register-ArgumentCompleter -Native -CommandName local-model -ScriptBlock {{
+    param($wordToComplete, $commandAst, $cursorPosition)
+
+    $commands = @({commands})
+    $modelCommands = @({model_commands})
+    $elements = @($commandAst.CommandElements | ForEach-Object {{
+        $_.Extent.Text
+    }})
+
+    if ($elements.Count -le 2) {{
+        local-model complete commands --prefix $wordToComplete 2>$null | ForEach-Object {{
+            [System.Management.Automation.CompletionResult]::new($_, $_, 'ParameterValue', $_)
+        }}
+        return
+    }}
+
+    $command = $elements[1]
+    if ($modelCommands -contains $command) {{
+        $extra = @()
+        if ($command -eq 'stop') {{ $extra = @('--include-all') }}
+        local-model complete models --prefix $wordToComplete @extra 2>$null | ForEach-Object {{
+            [System.Management.Automation.CompletionResult]::new($_, $_, 'ParameterValue', $_)
+        }}
+    }}
+}}
+"""
+
+
+def _powershell_profile_path():
+    script = "$PROFILE"
+    try:
+        r = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", script],
+            capture_output=True, text=True, timeout=5,
+        )
+        path = (r.stdout or "").strip()
+        return Path(path) if path else None
+    except Exception:
+        return None
+
+
+def _install_powershell_completion():
+    profile = _powershell_profile_path()
+    if not profile:
+        print("Could not resolve PowerShell profile path.", file=sys.stderr)
+        sys.exit(1)
+
+    start = "# >>> local-model completion >>>"
+    end = "# <<< local-model completion <<<"
+    block = (
+        f"{start}\n"
+        "local-model completion powershell | Out-String | Invoke-Expression\n"
+        f"{end}\n"
+    )
+    existing = profile.read_text() if profile.exists() else ""
+    if start in existing:
+        print(f"PowerShell completion already installed in: {profile}")
+        return
+
+    profile.parent.mkdir(parents=True, exist_ok=True)
+    with open(profile, "a", encoding="utf-8") as f:
+        if existing and not existing.endswith(("\n", "\r")):
+            f.write("\n")
+        f.write("\n" + block)
+
+    print(f"Installed PowerShell completion in: {profile}")
+    print("Open a new PowerShell session, or run this now:")
+    print("  local-model completion powershell | Out-String | Invoke-Expression")
+
+
+def cmd_completion(args):
+    if args.action == "powershell":
+        args.shell = "powershell"
+        args.action = "print"
+    if not args.shell:
+        args.shell = "powershell"
+
+    if args.action == "install":
+        if args.shell == "powershell":
+            _install_powershell_completion()
+            return
+        print(f"Unsupported shell: {args.shell}", file=sys.stderr)
+        sys.exit(1)
+
+    if args.shell == "powershell":
+        print(_powershell_completion_script())
+        return
+    print(f"Unsupported shell: {args.shell}", file=sys.stderr)
+    sys.exit(1)
+
+
 def cmd_help(args):
     print("local-model — manage local LLM inference servers\n")
 
     print("Commands:")
     print(f"  {'list':<30} Show available models and their status")
     print(f"  {'start <model> [--ctx N]':<30} Start a model server")
-    print(f"  {'serve <model> [--off]':<30} Start + expose a model over Tailscale HTTPS")
+    print(f"  {'serve <model> [--lan]':<30} Start + expose a model over Tailscale/LAN")
     print(f"  {'stop <model|all>':<30} Stop a running model server")
     print(f"  {'status':<30} Show running servers with health info")
     print(f"  {'monitor [--once]':<30} Show RAM/VRAM attribution bars")
@@ -2782,6 +3100,7 @@ def cmd_help(args):
     print(f"  {'edit <model> [--port N ...]':<30} Edit a model's name, port, context, runtime args")
     print(f"  {'add-remote <url> [name]':<30} Register a remote model (e.g. over Tailscale)")
     print(f"  {'sync-pi':<30} How to refresh pi after registry changes")
+    print(f"  {'completion install powershell':<30} Enable PowerShell tab completion")
     print(f"  {'config':<30} Show configuration and backend paths")
     print(f"  {'config --set-backend N path':<30} Configure a named backend binary")
     print(f"  {'help':<30} Show this help")
@@ -2815,6 +3134,7 @@ def main():
               local-model list                              Show all models and status
               local-model add hf:prism-ml/Ternary-Bonsai-8B-gguf   Download from HF
               local-model start bonsai                      Start a model server
+              local-model serve bonsai --lan                Expose on LAN + print scan target
               local-model stop all                          Stop all running servers
               local-model monitor --once                     Show RAM/VRAM attribution bars
               local-model scan --register                    Find and register LAN model servers
@@ -2835,9 +3155,11 @@ def main():
     p.add_argument("model", help="Model name or 'all'")
 
     p = sub.add_parser("serve",
-                       help="Start (if needed) and expose a model over Tailscale HTTPS")
+                       help="Start (if needed) and expose a model over Tailscale/LAN")
     p.add_argument("model", help="Model name")
     p.add_argument("--ctx", type=int, help="Override context window when starting")
+    p.add_argument("--lan", action="store_true",
+                   help="Bind to 0.0.0.0 and print the LAN OpenAI base URL")
     p.add_argument("--off", action="store_true",
                    help="Stop serving (remove the Tailscale HTTPS mapping)")
 
@@ -2859,7 +3181,7 @@ def main():
     p.add_argument("--max-hosts", type=int, default=512,
                    help="Safety limit for expanded targets")
     p.add_argument("--register", action="store_true",
-                   help="Register discovered endpoints as remote models")
+                   help="Register all discovered models without prompting")
     p.add_argument("--context", type=int, default=8192,
                    help="Context window used for registrations")
 
@@ -2908,6 +3230,18 @@ def main():
     p = sub.add_parser("sync-pi", help="How to refresh pi after registry changes (registry-driven)")
     p.add_argument("model", nargs="?", help="Model name (default: all registered)")
 
+    p = sub.add_parser("completion", help="Print or install shell completion setup")
+    p.add_argument("action", nargs="?", default="print",
+                   choices=["print", "install", "powershell"],
+                   help="Use 'install' to add completion to your shell profile")
+    p.add_argument("shell", nargs="?", choices=["powershell"],
+                   help="Shell to generate/install completion for")
+
+    p = sub.add_parser("complete", help=argparse.SUPPRESS)
+    p.add_argument("kind", choices=["commands", "models"])
+    p.add_argument("--prefix", default="")
+    p.add_argument("--include-all", action="store_true")
+
     p = sub.add_parser("config", help="Show / edit configuration")
     p.add_argument("--set-backend", nargs=2, metavar=("NAME", "PATH"),
                     help="Set a named backend binary path")
@@ -2938,6 +3272,8 @@ def main():
         "info": cmd_info,
         "edit": cmd_edit,
         "sync-pi": cmd_sync_pi,
+        "completion": cmd_completion,
+        "complete": cmd_complete,
         "config": cmd_config,
         "help": cmd_help,
     }

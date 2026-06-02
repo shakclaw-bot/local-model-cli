@@ -133,6 +133,7 @@ Example `bench` output:
 |---------|-------------|
 | `local-model list` | Show registered models with status and bench speeds |
 | `local-model start <model> [--ctx N]` | Start a model server |
+| `local-model serve <model> [--lan]` | Expose a model over Tailscale HTTPS and/or your LAN |
 | `local-model stop <model\|all>` | Stop running server(s) |
 | `local-model status` | Show running servers with health and slot info |
 | `local-model scan [--register]` | Scan localhost and the LAN for OpenAI-compatible `/v1/models` endpoints |
@@ -142,7 +143,24 @@ Example `bench` output:
 | `local-model test <model> [--prompts N]` | Quick quality smoke test (reasoning, coding, factual, creative) |
 | `local-model add <path\|hf:repo> [name]` | Register a GGUF model (local file or Hugging Face) |
 | `local-model info <model>` | Show model details, file size, GGUF metadata |
+| `local-model completion install powershell` | Enable PowerShell tab completion |
 | `local-model config [--set-backend N PATH]` | Show / edit configuration (home dir, backends, platform) |
+
+## Shell completion
+
+PowerShell tab completion can complete commands and registered model keys:
+
+```powershell
+local-model completion install powershell
+```
+
+This appends a small loader to your PowerShell profile. Open a new PowerShell session, then typing `local-model start qw` and pressing Tab completes matching registered models such as `qwen3.6-35b`.
+
+For the current terminal only, run:
+
+```powershell
+local-model completion powershell | Out-String | Invoke-Expression
+```
 
 ## Configuration
 
@@ -232,7 +250,28 @@ local-model scan --target 100.64.0.0/24 --ports 8080,8000,11434
 local-model scan --register
 ```
 
-By default, scanning is read-only. Add `--register` to save each discovered endpoint as a remote model in `~/.local-model/registry.json`; duplicate remote URLs are skipped.
+When models are found, an interactive terminal shows a selectable list:
+
+```text
+[ ]  1. qwen3.6-35b  @  http://192.168.1.25:8080/v1
+[>] Add selected models
+```
+
+Pick the model numbers to add them to `~/.local-model/registry.json`. Use `--register` to add every discovered model without prompting. Remote models appear in `local-model list` as `online`, `offline`, or `connected`.
+
+To make a local model discoverable from another machine on your LAN, serve it with `--lan`:
+
+```bash
+# On the desktop running inference:
+local-model serve bonsai --lan
+# prints, for example: http://192.168.1.25:8080/v1
+
+# On the laptop:
+local-model scan --target 192.168.1.25 --ports 8080
+local-model start qwen3.6-35b
+```
+
+`local-model start` on a remote model connects to the endpoint and prints the `base_url`, `model`, and `api_key` values to point a Pi agent or any OpenAI-compatible client at the desktop. `--lan` binds the model server to `0.0.0.0`; allow inbound TCP for the model port in your OS firewall if another device cannot reach it.
 
 ## VRAM auto-sizing for MoE models (`auto_ncmoe`)
 
