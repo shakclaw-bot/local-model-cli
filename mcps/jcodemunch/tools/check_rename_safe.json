@@ -1,0 +1,26 @@
+{
+  "name": "check_rename_safe",
+  "description": "Check whether renaming a symbol to a new name would cause name collisions. Scans the symbol's own file and every file that imports it, looking for an existing symbol with the proposed new name. Returns safe=true when no collisions are found. Run this before any rename/refactor to avoid silent breakage.",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "repo": {
+        "type": "string",
+        "description": "Repository identifier (owner/repo or just repo name)"
+      },
+      "symbol_id": {
+        "type": "string",
+        "description": "Symbol ID to rename (e.g. 'src/utils.py::helper#function'). Bare name accepted when unambiguous."
+      },
+      "new_name": {
+        "type": "string",
+        "description": "Proposed new symbol name (not a full ID, just the name)."
+      }
+    },
+    "required": [
+      "repo",
+      "symbol_id",
+      "new_name"
+    ]
+  }
+}

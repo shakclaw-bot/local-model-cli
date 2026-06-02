@@ -6,6 +6,7 @@ Usage:
   local-model start <model> [--ctx N]     Start a model server
   local-model stop <model|all>            Stop a running model server
   local-model status                      Show running servers with health + memory
+  local-model monitor                     Show RAM/VRAM attribution bars
   local-model test <model> [--prompts N]  Run quality tests against a running model
   local-model bench <model> [--ctx N]     Run speed benchmark
   local-model add <path|hf-repo> [name]   Register a new GGUF model
@@ -13,7 +14,7 @@ Usage:
   local-model config                      Show / edit configuration
 """
 from __future__ import annotations
-import argparse, json, os, platform, signal, shutil, struct, subprocess, sys
+import argparse, json, os, platform, re, signal, shutil, struct, subprocess, sys
 import textwrap, time, urllib.request, urllib.error
 from pathlib import Path
 
@@ -276,6 +277,629 @@ def check_health(port, timeout=3):
         return False
 
 
+# ── External Providers ─────────────────────────────────────────────────────
+
+OLLAMA_URL = "http://127.0.0.1:11434"
+WHISPER_ROOT = Path(os.environ.get("WHISPER_CPP_ROOT", Path.home() / "whisper.cpp"))
+WHISPER_MODELS = WHISPER_ROOT / "models"
+WHISPER_DEFAULT_PORT = 8178
+KOKORO_ROOT = Path(os.environ.get("KOKORO_FASTAPI_ROOT", r"X:\Local-Model\kokoro-fastapi"))
+KOKORO_MODEL = KOKORO_ROOT / "api" / "src" / "models" / "v1_0" / "kokoro-v1_0.pth"
+KOKORO_DEFAULT_PORT = 8880
+BONSAI_IMAGE_ROOT = Path(os.environ.get("BONSAI_IMAGE_ROOT", r"X:\Local-Model\bonsai-image-gemlite"))
+BONSAI_IMAGE_DEFAULT_PORT = 8000
+VOXCPM_ROOT = Path(os.environ.get("VOXCPM_ROOT", r"X:\Local-Model\VoxCPM"))
+VOXCPM_MODEL_DIR = Path(os.environ.get("VOXCPM_MODEL_PATH", r"X:\Local-Model\models\openbmb__VoxCPM2"))
+VOXCPM_DEFAULT_PORT = 8808
+
+
+def _http_json(url, timeout=1.5):
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as r:
+            return json.loads(r.read())
+    except Exception:
+        return None
+
+
+def _http_text(url, timeout=1.5, max_bytes=65536):
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as r:
+            body = r.read(max_bytes)
+            charset = r.headers.get_content_charset() or "utf-8"
+            return r.getcode(), body.decode(charset, errors="replace")
+    except Exception:
+        return None, ""
+
+
+def _fmt_bytes(num):
+    if num in (None, ""):
+        return "-"
+    try:
+        num = float(num)
+    except (TypeError, ValueError):
+        return "-"
+    units = ["B", "KB", "MB", "GB", "TB"]
+    for unit in units:
+        if abs(num) < 1024 or unit == units[-1]:
+            if unit == "B":
+                return f"{int(num)} {unit}"
+            return f"{num:.1f} {unit}"
+        num /= 1024
+    return "-"
+
+
+def _dir_size(path):
+    if not path or not Path(path).is_dir():
+        return None
+    total = 0
+    try:
+        for root, _dirs, files in os.walk(path):
+            for name in files:
+                try:
+                    total += os.path.getsize(os.path.join(root, name))
+                except OSError:
+                    pass
+    except OSError:
+        return None
+    return total
+
+
+def _process_snapshots():
+    """Best-effort process table with pid/name/command/working-set bytes."""
+    if os.name == "nt":
+        ps = (
+            "Get-CimInstance Win32_Process | "
+            "Select-Object ProcessId,Name,CommandLine,WorkingSetSize | "
+            "ConvertTo-Json -Compress"
+        )
+        try:
+            r = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
+                               capture_output=True, text=True, timeout=10)
+            data = json.loads(r.stdout or "[]")
+            if isinstance(data, dict):
+                data = [data]
+            out = {}
+            for p in data:
+                pid = p.get("ProcessId")
+                if pid is None:
+                    continue
+                out[int(pid)] = {
+                    "pid": int(pid),
+                    "name": p.get("Name") or "",
+                    "cmd": p.get("CommandLine") or "",
+                    "rss": int(p.get("WorkingSetSize") or 0),
+                }
+            return out
+        except Exception:
+            return {}
+
+    try:
+        r = subprocess.run(["ps", "-eo", "pid=,rss=,comm=,args="],
+                           capture_output=True, text=True, timeout=10)
+        out = {}
+        for line in r.stdout.splitlines():
+            parts = line.strip().split(None, 3)
+            if len(parts) < 3:
+                continue
+            pid, rss_kb, name = parts[:3]
+            cmd = parts[3] if len(parts) > 3 else name
+            out[int(pid)] = {
+                "pid": int(pid),
+                "name": name,
+                "cmd": cmd,
+                "rss": int(rss_kb) * 1024,
+            }
+        return out
+    except Exception:
+        return {}
+
+
+def _system_memory():
+    """Return total/used RAM bytes."""
+    if os.name == "nt":
+        try:
+            import ctypes
+            class MEMORYSTATUSEX(ctypes.Structure):
+                _fields_ = [
+                    ("dwLength", ctypes.c_ulong),
+                    ("dwMemoryLoad", ctypes.c_ulong),
+                    ("ullTotalPhys", ctypes.c_ulonglong),
+                    ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong),
+                    ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong),
+                    ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+                ]
+            stat = MEMORYSTATUSEX()
+            stat.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat)):
+                return int(stat.ullTotalPhys), int(stat.ullTotalPhys - stat.ullAvailPhys)
+        except Exception:
+            pass
+    try:
+        pages = os.sysconf("SC_PHYS_PAGES")
+        avail = os.sysconf("SC_AVPHYS_PAGES")
+        page_size = os.sysconf("SC_PAGE_SIZE")
+        total = pages * page_size
+        used = (pages - avail) * page_size
+        return int(total), int(used)
+    except Exception:
+        return None, None
+
+
+def _gpu_memory(target_pids=None):
+    """Return total/used/free VRAM bytes and per-process VRAM bytes."""
+    target_pids = {int(pid) for pid in (target_pids or []) if pid}
+    try:
+        r = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.total,memory.used,memory.free",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5, check=True,
+        )
+        total_mb, used_mb, free_mb = [
+            int(x.strip()) for x in r.stdout.strip().splitlines()[0].split(",")
+        ]
+    except Exception:
+        return None, None, None, {}
+
+    per_pid = {}
+    try:
+        r = subprocess.run(
+            ["nvidia-smi", "--query-compute-apps=pid,process_name,used_memory",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5,
+        )
+        for line in r.stdout.splitlines():
+            parts = [p.strip() for p in line.split(",")]
+            if len(parts) < 3 or not parts[0].isdigit() or not parts[2].isdigit():
+                continue
+            pid = int(parts[0])
+            if target_pids and pid not in target_pids:
+                continue
+            per_pid[pid] = {
+                "name": Path(parts[1]).name,
+                "vram": int(parts[2]) * 1024 * 1024,
+            }
+    except Exception:
+        pass
+
+    missing_pids = target_pids - set(per_pid)
+    if os.name == "nt" and missing_pids:
+        per_pid.update(_windows_gpu_process_memory(missing_pids))
+    return total_mb * 1024 * 1024, used_mb * 1024 * 1024, free_mb * 1024 * 1024, per_pid
+
+
+def _windows_gpu_adapter_used():
+    ps = (
+        "(Get-Counter '\\GPU Adapter Memory(*)\\Dedicated Usage' "
+        "-ErrorAction SilentlyContinue).CounterSamples | "
+        "Select-Object InstanceName,CookedValue | ConvertTo-Json -Compress"
+    )
+    try:
+        r = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
+                           capture_output=True, text=True, timeout=5)
+        data = json.loads(r.stdout or "[]")
+        if isinstance(data, dict):
+            data = [data]
+    except Exception:
+        return None
+
+    values = []
+    for sample in data:
+        try:
+            values.append(int(float(sample.get("CookedValue") or 0)))
+        except (TypeError, ValueError):
+            pass
+    return max(values) if values else None
+
+
+def _windows_gpu_process_memory(target_pids=None):
+    target_pids = {int(pid) for pid in (target_pids or []) if pid}
+    ps = (
+        "(Get-Counter '\\GPU Process Memory(*)\\Dedicated Usage' "
+        "-ErrorAction SilentlyContinue).CounterSamples | "
+        "Where-Object { $_.CookedValue -gt 0 } | "
+        "Select-Object InstanceName,CookedValue | ConvertTo-Json -Compress"
+    )
+    try:
+        r = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
+                           capture_output=True, text=True, timeout=5)
+        data = json.loads(r.stdout or "[]")
+        if isinstance(data, dict):
+            data = [data]
+    except Exception:
+        return {}
+
+    out = {}
+    for sample in data:
+        m = re.search(r"pid_(\d+)_", sample.get("InstanceName", ""))
+        if not m:
+            continue
+        try:
+            value = int(float(sample.get("CookedValue") or 0))
+        except (TypeError, ValueError):
+            continue
+        if value <= 0:
+            continue
+        pid = int(m.group(1))
+        if target_pids and pid not in target_pids:
+            continue
+        item = out.setdefault(pid, {"name": "", "vram": 0})
+        item["vram"] += value
+    return out
+
+
+def _port_owner_pid(port):
+    """Best-effort listener owner lookup for local services."""
+    try:
+        port = int(port)
+    except (TypeError, ValueError):
+        return None
+
+    if os.name == "nt":
+        ps = (
+            f"$c = Get-NetTCPConnection -LocalPort {port} -State Listen "
+            "-ErrorAction SilentlyContinue | Select-Object -First 1; "
+            "if ($c) { $c.OwningProcess }"
+        )
+        try:
+            r = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
+                               capture_output=True, text=True, timeout=3)
+            for line in r.stdout.splitlines():
+                line = line.strip()
+                if line.isdigit():
+                    return int(line)
+        except Exception:
+            return None
+    return None
+
+
+def _discover_ollama():
+    tags = _http_json(OLLAMA_URL + "/api/tags") or {}
+    ps = _http_json(OLLAMA_URL + "/api/ps") or {}
+    installed = {m.get("name") or m.get("model"): m
+                 for m in tags.get("models", []) if m.get("name") or m.get("model")}
+    running = {m.get("name") or m.get("model"): m
+               for m in ps.get("models", []) if m.get("name") or m.get("model")}
+    rows = []
+    for name in sorted(set(installed) | set(running)):
+        meta = running.get(name) or installed.get(name) or {}
+        details = meta.get("details") or {}
+        ctx = details.get("context_length") or "?"
+        q = details.get("quantization_level")
+        family = details.get("family")
+        display = name
+        if family or q:
+            display += f" ({'/'.join(x for x in [family, q] if x)})"
+        rows.append({
+            "key": f"ollama:{name}",
+            "source": "ollama",
+            "kind": "llm",
+            "name": display,
+            "port": 11434,
+            "context": ctx,
+            "size": meta.get("size"),
+            "ram": None,
+            "vram": meta.get("size_vram") if name in running else None,
+            "status": "running" if name in running else "available",
+        })
+    return rows
+
+
+def _whisper_processes(processes=None):
+    processes = processes or _process_snapshots()
+    out = []
+    for p in processes.values():
+        name = (p.get("name") or "").lower()
+        cmd = (p.get("cmd") or "").lower()
+        if "whisper-server" in name or "whisper-server" in cmd:
+            out.append(p)
+    return out
+
+
+def _parse_arg_value(cmd, flag):
+    if not cmd:
+        return None
+    m = re.search(rf"{re.escape(flag)}\s+\"([^\"]+)\"", cmd)
+    if m:
+        return m.group(1)
+    m = re.search(rf"{re.escape(flag)}\s+(\S+)", cmd)
+    return m.group(1) if m else None
+
+
+def _discover_whisper(processes=None):
+    processes = processes or _process_snapshots()
+    running = _whisper_processes(processes)
+    running_by_model = {}
+    for p in running:
+        model = _parse_arg_value(p.get("cmd", ""), "-m")
+        if model:
+            running_by_model[Path(model).name] = p
+
+    model_files = []
+    if WHISPER_MODELS.is_dir():
+        model_files = [
+            p for p in WHISPER_MODELS.glob("*.bin")
+            if not p.name.startswith("for-tests-")
+        ]
+
+    if not model_files and running:
+        model_files = [Path(_parse_arg_value(running[0].get("cmd", ""), "-m") or "whisper.cpp")]
+
+    rows = []
+    for model in sorted(model_files, key=lambda p: p.name.lower()):
+        proc = running_by_model.get(model.name) or (running[0] if running else None)
+        port = _parse_arg_value(proc.get("cmd", ""), "--port") if proc else WHISPER_DEFAULT_PORT
+        rows.append({
+            "key": f"whisper:{model.stem}",
+            "source": "whisper.cpp",
+            "kind": "stt",
+            "name": model.name,
+            "port": int(port) if str(port).isdigit() else port,
+            "context": "-",
+            "size": model.stat().st_size if model.exists() else None,
+            "ram": proc.get("rss") if proc else None,
+            "vram": None,
+            "pid": proc.get("pid") if proc else None,
+            "status": "running" if proc else "available",
+        })
+    return rows
+
+
+def _looks_like_kokoro_process(proc):
+    cmd = (proc.get("cmd") or "").lower()
+    name = (proc.get("name") or "").lower()
+    return (
+        "kokoro" in name
+        or "kokoro-fastapi" in cmd
+        or "run-kokoro" in cmd
+        or ("uvicorn" in cmd and "api.src.main:app" in cmd)
+    )
+
+
+def _kokoro_processes(processes=None):
+    processes = processes or _process_snapshots()
+    return [p for p in processes.values() if _looks_like_kokoro_process(p)]
+
+
+def _pick_likely_model_process(candidates):
+    return max(candidates, key=lambda p: p.get("rss") or 0) if candidates else None
+
+
+def _kokoro_reachable(port, timeout=1.5):
+    health = _http_json(f"http://127.0.0.1:{port}/health", timeout=timeout)
+    if isinstance(health, dict):
+        status = str(health.get("status", "")).lower()
+        if status in ("ok", "healthy"):
+            return True
+
+    models = _http_json(f"http://127.0.0.1:{port}/v1/models", timeout=timeout)
+    return isinstance(models, dict) and bool(models.get("data") or models.get("object"))
+
+
+def _discover_kokoro(processes=None, fast=False):
+    processes = processes or _process_snapshots()
+    port = KOKORO_DEFAULT_PORT
+    candidates = _kokoro_processes(processes)
+    proc = _pick_likely_model_process(candidates)
+    pid = proc.get("pid") if proc else None
+
+    if proc:
+        parsed_port = _parse_arg_value(proc.get("cmd", ""), "--port")
+        if parsed_port and str(parsed_port).isdigit():
+            port = int(parsed_port)
+    elif not fast:
+        pid = _port_owner_pid(port)
+        proc = processes.get(pid) if pid else None
+
+    if proc and not _looks_like_kokoro_process(proc) and not _kokoro_reachable(port):
+        proc = None
+        pid = None
+
+    should_probe = bool(proc or pid or (not fast and os.name != "nt"))
+    reachable = _kokoro_reachable(port, timeout=0.25 if fast else 1.5) if should_probe else False
+    if not (KOKORO_ROOT.exists() or proc or reachable):
+        return []
+
+    if reachable:
+        status = "running"
+    elif proc:
+        status = "starting"
+    elif KOKORO_MODEL.exists():
+        status = "available"
+    else:
+        status = "missing"
+
+    return [{
+        "key": "kokoro:kokoro-v1_0",
+        "source": "kokoro",
+        "kind": "tts",
+        "name": KOKORO_MODEL.name,
+        "port": port,
+        "context": "-",
+        "size": KOKORO_MODEL.stat().st_size if KOKORO_MODEL.exists() else None,
+        "ram": proc.get("rss") if proc else None,
+        "vram": None,
+        "pid": pid,
+        "status": status,
+    }]
+
+
+def _looks_like_bonsai_image_process(proc):
+    cmd = (proc.get("cmd") or "").lower()
+    return (
+        "bonsai-image-gemlite" in cmd
+        or "scripts.local_backend:app" in cmd
+        or "local_backend.py" in cmd
+    )
+
+
+def _bonsai_image_processes(processes=None):
+    processes = processes or _process_snapshots()
+    return [p for p in processes.values() if _looks_like_bonsai_image_process(p)]
+
+
+def _bonsai_image_backend(port, timeout=1.5):
+    info = _http_json(f"http://127.0.0.1:{port}/backends", timeout=timeout)
+    return info if isinstance(info, dict) else None
+
+
+def _bonsai_image_model_dir(backend=None):
+    if backend:
+        family = str(backend.get("default_family") or "").replace("bonsai-", "")
+        kind = str(backend.get("kind") or "gemlite")
+        if family:
+            path = BONSAI_IMAGE_ROOT / "models" / f"bonsai-image-4B-{family}-{kind}"
+            if path.is_dir():
+                return path
+
+    models = BONSAI_IMAGE_ROOT / "models"
+    if not models.is_dir():
+        return None
+    matches = sorted(models.glob("bonsai-image-4B-*-gemlite"))
+    return matches[0] if matches else None
+
+
+def _discover_bonsai_image(processes=None, fast=False):
+    processes = processes or _process_snapshots()
+    port = BONSAI_IMAGE_DEFAULT_PORT
+    candidates = _bonsai_image_processes(processes)
+    backend_candidates = [
+        p for p in candidates
+        if "scripts.local_backend:app" in (p.get("cmd") or "").lower()
+        or "local_backend.py" in (p.get("cmd") or "").lower()
+    ]
+    proc = _pick_likely_model_process(backend_candidates or candidates)
+    pid = proc.get("pid") if proc else None
+
+    if proc:
+        parsed_port = _parse_arg_value(proc.get("cmd", ""), "--port")
+        if parsed_port and str(parsed_port).isdigit():
+            port = int(parsed_port)
+    elif not fast:
+        pid = _port_owner_pid(port)
+        proc = processes.get(pid) if pid else None
+
+    if proc and not _looks_like_bonsai_image_process(proc) and not _bonsai_image_backend(port):
+        proc = None
+        pid = None
+
+    should_probe = bool(proc or pid or (not fast and os.name != "nt"))
+    backend = _bonsai_image_backend(port, timeout=0.25 if fast else 1.5) if should_probe else None
+    if not (BONSAI_IMAGE_ROOT.exists() or proc or backend):
+        return []
+
+    model_dir = _bonsai_image_model_dir(backend)
+    if backend and backend.get("healthy"):
+        status = "running"
+    elif proc:
+        status = "starting"
+    elif model_dir:
+        status = "available"
+    else:
+        status = "missing"
+
+    family = str((backend or {}).get("default_family") or "bonsai-image")
+    kind = str((backend or {}).get("kind") or "gemlite")
+    model_id = family if family.endswith(f"-{kind}") else f"{family}-{kind}"
+
+    return [{
+        "key": f"bonsai-image:{model_id}",
+        "source": "bonsai-image",
+        "kind": "image",
+        "name": model_dir.name if model_dir else "Bonsai Image 4B",
+        "port": port,
+        "context": "-",
+        "size": _dir_size(model_dir),
+        "ram": proc.get("rss") if proc else None,
+        "vram": None,
+        "pid": pid,
+        "status": status,
+    }]
+
+
+def _looks_like_voxcpm_process(proc):
+    cmd = (proc.get("cmd") or "").lower()
+    return (
+        "voxcpm" in cmd
+        or str(VOXCPM_ROOT).lower() in cmd
+        or ("app.py" in cmd and f"--port {VOXCPM_DEFAULT_PORT}" in cmd)
+    )
+
+
+def _voxcpm_processes(processes=None):
+    processes = processes or _process_snapshots()
+    return [p for p in processes.values() if _looks_like_voxcpm_process(p)]
+
+
+def _voxcpm_reachable(port, timeout=1.5):
+    config = _http_json(f"http://127.0.0.1:{port}/config", timeout=timeout)
+    if isinstance(config, dict):
+        text = json.dumps(config).lower()
+        if "voxcpm" in text:
+            return True
+
+    code, text = _http_text(f"http://127.0.0.1:{port}/", timeout=timeout)
+    return code == 200 and "voxcpm" in text.lower()
+
+
+def _discover_voxcpm(processes=None, fast=False):
+    processes = processes or _process_snapshots()
+    port = VOXCPM_DEFAULT_PORT
+    candidates = _voxcpm_processes(processes)
+    proc = _pick_likely_model_process(candidates)
+    pid = proc.get("pid") if proc else None
+
+    if proc:
+        parsed_port = _parse_arg_value(proc.get("cmd", ""), "--port")
+        if parsed_port and str(parsed_port).isdigit():
+            port = int(parsed_port)
+    elif not fast:
+        pid = _port_owner_pid(port)
+        proc = processes.get(pid) if pid else None
+
+    if proc and not _looks_like_voxcpm_process(proc) and not _voxcpm_reachable(port):
+        proc = None
+        pid = None
+
+    should_probe = bool(proc or pid or (not fast and os.name != "nt"))
+    reachable = _voxcpm_reachable(port, timeout=0.25 if fast else 1.5) if should_probe else False
+    if not (VOXCPM_ROOT.exists() or VOXCPM_MODEL_DIR.exists() or proc or reachable):
+        return []
+
+    if reachable:
+        status = "running"
+    elif proc:
+        status = "starting"
+    elif VOXCPM_MODEL_DIR.exists():
+        status = "available"
+    else:
+        status = "missing"
+
+    return [{
+        "key": "voxcpm:voxcpm2",
+        "source": "voxcpm",
+        "kind": "tts",
+        "name": VOXCPM_MODEL_DIR.name if VOXCPM_MODEL_DIR.exists() else "VoxCPM2",
+        "port": port,
+        "context": "-",
+        "size": _dir_size(VOXCPM_MODEL_DIR),
+        "ram": proc.get("rss") if proc else None,
+        "vram": None,
+        "pid": pid,
+        "status": status,
+    }]
+
+
+def _external_rows(processes=None, fast=False):
+    return (_discover_ollama() + _discover_whisper(processes)
+            + _discover_kokoro(processes, fast=fast)
+            + _discover_bonsai_image(processes, fast=fast)
+            + _discover_voxcpm(processes, fast=fast))
+
+
+
 # ── Server Command Builder ─────────────────────────────────────────────────
 
 def _query_free_vram_mb():
@@ -407,16 +1031,18 @@ def _get_bench_speeds(key):
 
 def cmd_list(args):
     registry = load_registry()
-    if not registry:
+    processes = _process_snapshots()
+    external = _external_rows(processes)
+    if not registry and not external:
         print("No models registered. Add one with:")
         print("  local-model add <path-to-gguf>")
         print("  local-model add hf:<huggingface-repo>")
         return
 
-    headers = ["Model", "Name", "Port", "Context", "tok/s in", "tok/s out", "Status"]
-    # Alignment for the first 6 (padded) columns; Status is last and unpadded
+    headers = ["Model", "Source", "Kind", "Name", "Port", "Context", "Size", "RAM", "VRAM", "Status"]
+    # Alignment for the first 9 (padded) columns; Status is last and unpadded
     # so its ANSI colour codes never throw off alignment.
-    aligns = ["<", "<", ">", ">", ">", ">"]
+    aligns = ["<", "<", "<", "<", ">", ">", ">", ">", ">"]
 
     rows = []
     for key, cfg in sorted(registry.items()):
@@ -427,20 +1053,18 @@ def cmd_list(args):
         else:
             ctx_str = str(ctx)
 
-        prompt_speed, gen_speed = _get_bench_speeds(key)
-        in_str = f"{prompt_speed:.0f}" if prompt_speed else "-"
-        out_str = f"{gen_speed:.1f}" if gen_speed else "-"
-
         if _is_remote(cfg):
             reachable = _check_endpoint(cfg)
             status = ("\033[36mremote ok\033[0m" if reachable
                       else "\033[31mremote down\033[0m")
-            rows.append([key, cfg.get("name", "?"), "remote", ctx_str,
-                         in_str, out_str, status])
+            rows.append([key, "local-model", "llm", cfg.get("name", "?"),
+                         "remote", ctx_str, "-", "-", "-", status])
             continue
 
         pid = get_running_pid(key)
         model_path = resolve_model_path(cfg)
+        rss = processes.get(pid, {}).get("rss") if pid else None
+        size = os.path.getsize(model_path) if model_path and os.path.isfile(model_path) else None
         if not model_path:
             status = "\033[31mmissing\033[0m"
         elif pid and check_health(port):
@@ -450,16 +1074,40 @@ def cmd_list(args):
         else:
             status = "\033[90mstopped\033[0m"
 
-        rows.append([key, cfg.get("name", "?"), str(port), ctx_str,
-                     in_str, out_str, status])
+        rows.append([key, "local-model", "llm", cfg.get("name", "?"),
+                     str(port), ctx_str, _fmt_bytes(size), _fmt_bytes(rss),
+                     "-", status])
 
-    # Column widths sized to the content (header + every cell), 6 padded cols.
+    for row in external:
+        status = row["status"]
+        if status == "running":
+            status = f"\033[32mrunning\033[0m (:{row['port']})"
+        elif status == "starting":
+            status = f"\033[33mstarting\033[0m (:{row['port']})"
+        elif status == "missing":
+            status = "\033[31mmissing\033[0m"
+        else:
+            status = "\033[90mavailable\033[0m"
+        rows.append([
+            row["key"],
+            row["source"],
+            row["kind"],
+            row["name"],
+            str(row["port"]),
+            str(row["context"]),
+            _fmt_bytes(row.get("size")),
+            _fmt_bytes(row.get("ram")),
+            _fmt_bytes(row.get("vram")),
+            status,
+        ])
+
+    # Column widths sized to the content (header + every cell), padded cols.
     widths = [max(len(headers[i]), *(len(r[i]) for r in rows))
               for i in range(len(aligns))]
 
     def _fmt(cells):
         parts = [f"{cells[i]:{aligns[i]}{widths[i]}}" for i in range(len(aligns))]
-        parts.append(cells[6])  # Status: last column, printed as-is
+        parts.append(cells[9])  # Status: last column, printed as-is
         return "  ".join(parts)
 
     header_line = _fmt(headers)
@@ -608,6 +1256,180 @@ def cmd_status(args):
 
     if not found:
         print("No models currently running.")
+
+
+def _monitor_items(registry, processes, gpu_per_pid):
+    items = []
+    for key, cfg in sorted(registry.items()):
+        if _is_remote(cfg):
+            continue
+        pid = get_running_pid(key)
+        if not pid:
+            continue
+        proc = processes.get(pid, {})
+        items.append({
+            "label": key,
+            "source": "local-model",
+            "pid": pid,
+            "ram": proc.get("rss") or 0,
+            "vram": (gpu_per_pid.get(pid) or {}).get("vram") or 0,
+        })
+
+    for row in _external_rows(processes, fast=True):
+        if row.get("status") not in ("running", "starting"):
+            continue
+        pid = row.get("pid")
+        items.append({
+            "label": row["key"],
+            "source": row["source"],
+            "pid": pid,
+            "ram": row.get("ram") or 0,
+            "vram": row.get("vram") or ((gpu_per_pid.get(pid) or {}).get("vram") if pid else 0),
+        })
+
+    return items
+
+
+_BAR_COLORS = ["31", "32", "33", "34", "35", "36", "91", "92", "93", "94", "95", "96"]
+
+
+def _render_bar(title, total, used, segments, width=54):
+    if not total:
+        return [f"{title:<5} unavailable"]
+
+    used = min(max(used or 0, 0), total)
+    segs = [(label, max(0, value or 0), color)
+            for label, value, color in segments if value and value > 0]
+    known = min(sum(v for _, v, _ in segs), used)
+    other = max(0, used - known)
+    if other:
+        segs.append(("other", other, "90"))
+
+    cells = []
+    used_cells = 0
+    for i, (_label, value, color) in enumerate(segs):
+        n = int(round(width * value / total))
+        if value > 0 and n == 0:
+            n = 1
+        remaining = width - used_cells
+        if i == len(segs) - 1:
+            n = min(n, remaining)
+        else:
+            n = min(n, max(0, remaining))
+        if n:
+            cells.append(f"\033[{color}m" + ("#" * n) + "\033[0m")
+            used_cells += n
+
+    free_cells = max(0, width - used_cells)
+    bar = "".join(cells) + "\033[90m" + ("-" * free_cells) + "\033[0m"
+    pct = used / total * 100
+    return [f"{title:<5} [{bar}] {pct:5.1f}%  {_fmt_bytes(used)} / {_fmt_bytes(total)}"]
+
+
+def _monitor_frame():
+    registry = load_registry()
+    processes = _process_snapshots()
+    items = _monitor_items(registry, processes, {})
+    target_pids = {item.get("pid") for item in items if item.get("pid")}
+    gpu_total, gpu_used, _gpu_free, gpu_per_pid = _gpu_memory(target_pids)
+    ram_total, ram_used = _system_memory()
+
+    for item in items:
+        pid = item.get("pid")
+        if pid and gpu_per_pid.get(pid):
+            item["vram"] = gpu_per_pid[pid].get("vram") or item.get("vram") or 0
+
+    color_by_label = {}
+    for i, item in enumerate(items):
+        color_by_label[item["label"]] = _BAR_COLORS[i % len(_BAR_COLORS)]
+
+    ram_segments = [
+        (item["label"], item.get("ram", 0), color_by_label[item["label"]])
+        for item in items
+    ]
+    vram_segments = [
+        (item["label"], item.get("vram", 0), color_by_label[item["label"]])
+        for item in items
+    ]
+    known_ram = sum(item.get("ram", 0) or 0 for item in items)
+    known_vram = sum(item.get("vram", 0) or 0 for item in items)
+    other_ram = max(0, (ram_used or 0) - known_ram) if ram_used is not None else None
+    other_vram = max(0, (gpu_used or 0) - known_vram) if gpu_used is not None else None
+
+    lines = [
+        "local-model monitor",
+        time.strftime("%Y-%m-%d %H:%M:%S"),
+        "",
+    ]
+    lines.extend(_render_bar("RAM", ram_total, ram_used, ram_segments))
+    lines.extend(_render_bar("VRAM", gpu_total, gpu_used, vram_segments))
+    lines.append("")
+    lines.append(f"{'Color':<7} {'Model':<32} {'Source':<12} {'PID':>7} {'RAM':>10} {'VRAM':>10}")
+    lines.append("-" * 84)
+    for item in items:
+        color = color_by_label[item["label"]]
+        swatch = f"\033[{color}m###\033[0m"
+        pid = item.get("pid") or "-"
+        lines.append(
+            f"{swatch:<16} {item['label']:<32} {item['source']:<12} "
+            f"{str(pid):>7} {_fmt_bytes(item.get('ram')):>10} {_fmt_bytes(item.get('vram')):>10}"
+        )
+    swatch = "\033[90m###\033[0m"
+    lines.append(
+        f"{swatch:<16} {'unattributed OS/process usage':<32} {'system':<12} "
+        f"{'-':>7} {_fmt_bytes(other_ram):>10} {_fmt_bytes(other_vram):>10}"
+    )
+    return "\n".join(lines)
+
+
+def _enable_virtual_terminal_output():
+    if os.name != "nt" or not sys.stdout.isatty():
+        return
+    try:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.GetStdHandle(-11)  # STD_OUTPUT_HANDLE
+        mode = ctypes.c_uint()
+        if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+            kernel32.SetConsoleMode(handle, mode.value | 0x0004)  # ENABLE_VIRTUAL_TERMINAL_PROCESSING
+    except Exception:
+        pass
+
+
+def cmd_monitor(args):
+    if args.once:
+        print(_monitor_frame())
+        return
+
+    if not sys.stdout.isatty():
+        try:
+            while True:
+                print(_monitor_frame())
+                print()
+                sys.stdout.flush()
+                time.sleep(args.interval)
+        except KeyboardInterrupt:
+            print("\nStopped.")
+        return
+
+    _enable_virtual_terminal_output()
+    try:
+        sys.stdout.write("\033[?1049h\033[?25l\033[H\033[J")
+        sys.stdout.flush()
+        next_refresh = time.monotonic()
+        while True:
+            next_refresh += args.interval
+            sys.stdout.write("\033[H")
+            sys.stdout.write(_monitor_frame())
+            sys.stdout.write("\033[J")
+            sys.stdout.flush()
+            time.sleep(max(0, next_refresh - time.monotonic()))
+    except KeyboardInterrupt:
+        pass
+    finally:
+        sys.stdout.write("\033[?25h\033[?1049l")
+        sys.stdout.flush()
+    print("Stopped.")
 
 
 # ── Test & Bench ────────────────────────────────────────────────────────────
@@ -1573,6 +2395,111 @@ def cmd_add_remote(args):
     print(f"Use it by pointing your client at: {url}")
 
 
+def _tailscale_bin():
+    """Locate the tailscale CLI (PATH, or the default Windows install path)."""
+    found = shutil.which("tailscale")
+    if found:
+        return found
+    if os.name == "nt":
+        candidate = r"C:\Program Files\Tailscale\tailscale.exe"
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+def _parse_serve_url(text):
+    """Pull the https://<host>.ts.net URL out of `tailscale serve` output."""
+    m = re.search(r"https://\S+\.ts\.net\S*", text or "")
+    return m.group(0) if m else None
+
+
+def _tailscale_https_url(ts):
+    """Best-effort https URL from `tailscale status --json` (Self.DNSName)."""
+    try:
+        r = subprocess.run([ts, "status", "--json"],
+                           capture_output=True, text=True, timeout=10)
+        data = json.loads(r.stdout)
+        dns = (data.get("Self") or {}).get("DNSName", "").rstrip(".")
+        return f"https://{dns}" if dns else None
+    except Exception:
+        return None
+
+
+def cmd_serve(args):
+    """Expose a local model over Tailscale HTTPS, starting it first if needed."""
+    _ensure_dirs()
+    registry = load_registry()
+    key = get_model_key(registry, args.model)
+    cfg = get_model(registry, args.model)
+
+    if _is_remote(cfg):
+        print(f"'{key}' is a remote model; serve is for local models only.",
+              file=sys.stderr)
+        sys.exit(1)
+
+    port = cfg.get("port", 8080)
+    ts = _tailscale_bin()
+    if not ts:
+        print("tailscale CLI not found.", file=sys.stderr)
+        print("Install Tailscale and sign in, then retry.", file=sys.stderr)
+        sys.exit(1)
+
+    # --off: remove the proxy mapping and exit.
+    if getattr(args, "off", False):
+        r = subprocess.run([ts, "serve", "--https=443", "off"],
+                           capture_output=True, text=True)
+        if r.returncode == 0:
+            print("Stopped serving (Tailscale https/443 mapping removed).")
+        else:
+            print((r.stderr or r.stdout or "failed to stop serve").strip(),
+                  file=sys.stderr)
+            sys.exit(1)
+        return
+
+    # 1. Ensure the model is up. cmd_start reports the already-running case and
+    #    exits non-zero on failure (which aborts serve too).
+    pid = get_running_pid(key)
+    if pid and check_health(port):
+        print(f"{cfg.get('name', key)} already running on port {port} (PID {pid}).")
+    else:
+        cmd_start(args)
+
+    # 2. Map the device's :443 to the local model port over Tailscale.
+    print(f"\nExposing port {port} over Tailscale (HTTPS)...")
+    r = subprocess.run(
+        [ts, "serve", "--bg", "--https=443", f"http://127.0.0.1:{port}"],
+        capture_output=True, text=True)
+    out = (r.stdout or "") + (r.stderr or "")
+    if r.returncode != 0:
+        if "not enabled" in out.lower():
+            print("Tailscale Serve is not enabled on your tailnet.", file=sys.stderr)
+            print("Enable HTTPS Certificates in the admin console, then retry:",
+                  file=sys.stderr)
+            print("  https://login.tailscale.com/admin/dns", file=sys.stderr)
+        else:
+            print(out.strip() or "tailscale serve failed", file=sys.stderr)
+        sys.exit(1)
+
+    # 3. Resolve the public URL and print client-ready details.
+    url = _parse_serve_url(out) or _tailscale_https_url(ts)
+    base = (url.rstrip("/") + "/v1") if url else None
+    mp = cfg.get("file") or cfg.get("model")
+    model_id = os.path.basename(str(mp)) if mp else key
+
+    print("Serving over Tailscale:")
+    if url:
+        print(f"  URL:    {url.rstrip('/')}")
+        print(f"  OpenAI: {base}")
+    print(f"  Model:  {cfg.get('name', key)} (port {port})")
+    print(f"  Health: {'OK' if check_health(port) else 'NOT READY'}")
+    if base:
+        print("\nPoint a remote client (Hermes / OpenClaw / any OpenAI SDK) at:")
+        print(f"  base_url = {base}")
+        print(f"  model    = {model_id}")
+        print("  api_key  = not-needed")
+    print(f"\nStop serving with: local-model serve {key} --off")
+
+
 def cmd_config(args):
     config = _load_config()
 
@@ -1625,8 +2552,10 @@ def cmd_help(args):
     print("Commands:")
     print(f"  {'list':<30} Show available models and their status")
     print(f"  {'start <model> [--ctx N]':<30} Start a model server")
+    print(f"  {'serve <model> [--off]':<30} Start + expose a model over Tailscale HTTPS")
     print(f"  {'stop <model|all>':<30} Stop a running model server")
     print(f"  {'status':<30} Show running servers with health info")
+    print(f"  {'monitor [--once]':<30} Show RAM/VRAM attribution bars")
     print(f"  {'test <model> [--prompts N]':<30} Run quality tests (reasoning, coding, factual)")
     print(f"  {'bench <model> [--ctx N]':<30} Run speed benchmark at multiple context sizes")
     print(f"  {'eval <model> [--questions N]':<30} Accuracy eval (GSM8K reasoning + needle)")
@@ -1669,6 +2598,7 @@ def main():
               local-model add hf:prism-ml/Ternary-Bonsai-8B-gguf   Download from HF
               local-model start bonsai                      Start a model server
               local-model stop all                          Stop all running servers
+              local-model monitor --once                     Show RAM/VRAM attribution bars
               local-model test bonsai                       Run quality tests
               local-model bench bonsai                      Run speed benchmark
               local-model config --set-backend default /usr/local/bin/llama-server
@@ -1685,7 +2615,18 @@ def main():
     p = sub.add_parser("stop", help="Stop a running model server")
     p.add_argument("model", help="Model name or 'all'")
 
+    p = sub.add_parser("serve",
+                       help="Start (if needed) and expose a model over Tailscale HTTPS")
+    p.add_argument("model", help="Model name")
+    p.add_argument("--ctx", type=int, help="Override context window when starting")
+    p.add_argument("--off", action="store_true",
+                   help="Stop serving (remove the Tailscale HTTPS mapping)")
+
     sub.add_parser("status", help="Show running servers with health info")
+
+    p = sub.add_parser("monitor", help="Show RAM/VRAM attribution bars")
+    p.add_argument("--interval", type=float, default=2.0, help="Refresh interval seconds")
+    p.add_argument("--once", action="store_true", help="Print one frame and exit")
 
     p = sub.add_parser("test", help="Run quality tests against a running model")
     p.add_argument("model", help="Model name")
@@ -1749,8 +2690,10 @@ def main():
     commands = {
         "list": cmd_list,
         "start": cmd_start,
+        "serve": cmd_serve,
         "stop": cmd_stop,
         "status": cmd_status,
+        "monitor": cmd_monitor,
         "test": cmd_test,
         "bench": cmd_bench,
         "eval": cmd_eval,

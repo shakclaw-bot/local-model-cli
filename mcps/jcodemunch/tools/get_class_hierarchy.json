@@ -1,0 +1,21 @@
+{
+  "name": "get_class_hierarchy",
+  "description": "Get the full inheritance hierarchy for a class: ancestors (base classes via extends/implements) and descendants (subclasses/implementors). Works across Python, Java, TypeScript, C#, and any language where class signatures contain 'extends' or 'implements'.",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "repo": {
+        "type": "string",
+        "description": "Repository identifier (owner/repo or just repo name)"
+      },
+      "class_name": {
+        "type": "string",
+        "description": "Name of the class to analyse"
+      }
+    },
+    "required": [
+      "repo",
+      "class_name"
+    ]
+  }
+}

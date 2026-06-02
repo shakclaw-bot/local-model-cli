@@ -1,0 +1,21 @@
+{
+  "name": "get_coupling_metrics",
+  "description": "Return afferent coupling (Ca), efferent coupling (Ce), and instability score for a file/module. Ca = files that import this module (dependents). Ce = files this module imports (dependencies). Instability I = Ce/(Ca+Ce): 0 = stable, 1 = unstable. Use to identify fragile modules and guide refactoring priorities.",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "repo": {
+        "type": "string",
+        "description": "Repository identifier (owner/repo or just repo name)"
+      },
+      "module_path": {
+        "type": "string",
+        "description": "File path within the repo (e.g. 'src/utils.py')"
+      }
+    },
+    "required": [
+      "repo",
+      "module_path"
+    ]
+  }
+}

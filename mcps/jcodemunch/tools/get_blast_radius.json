@@ -1,0 +1,45 @@
+{
+  "name": "get_blast_radius",
+  "description": "Find all files affected by changing a symbol. Returns confirmed files (import + name match) and potential files (import only, e.g. wildcard). Use before renaming or deleting a symbol. Set cross_repo=true to also find consumers in other indexed repos.",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "repo": {
+        "type": "string",
+        "description": "Repository identifier (owner/repo or just repo name)"
+      },
+      "symbol": {
+        "type": "string",
+        "description": "Symbol name or ID to analyse (e.g. 'calculateScore' or a full symbol ID)"
+      },
+      "depth": {
+        "type": "integer",
+        "description": "Import hops to traverse (1 = direct importers only, max 3). Default 1.",
+        "default": 1
+      },
+      "include_depth_scores": {
+        "type": "boolean",
+        "description": "When true, adds impact_by_depth (files grouped by hop distance) and per-depth risk scores. overall_risk_score and direct_dependents_count are always included. Default false.",
+        "default": false
+      },
+      "cross_repo": {
+        "type": "boolean",
+        "description": "When true, also find files in other indexed repos that consume this repo's package. Default: false.",
+        "default": false
+      },
+      "call_depth": {
+        "type": "integer",
+        "description": "When > 0, also find symbols that *call* this symbol (call-level analysis). Returns a callers list alongside the import-level confirmed/potential. Max 3. Default 0 (disabled).",
+        "default": 0
+      },
+      "fqn": {
+        "type": "string",
+        "description": "PHP fully-qualified class name (e.g. 'App\\Models\\User'). Resolves to symbol via PSR-4. Alternative to symbol."
+      }
+    },
+    "required": [
+      "repo",
+      "symbol"
+    ]
+  }
+}

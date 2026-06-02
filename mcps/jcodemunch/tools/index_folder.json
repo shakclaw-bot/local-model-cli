@@ -1,0 +1,38 @@
+{
+  "name": "index_folder",
+  "description": "Index a local folder containing source code. Response includes `discovery_skip_counts` (files filtered per reason), `no_symbols_count`/`no_symbols_files` (files with no extractable symbols) for diagnosing missing files. Set JCODEMUNCH_USE_AI_SUMMARIES=false to disable AI summaries globally.",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "path": {
+        "type": "string",
+        "description": "Path to local folder (absolute or relative, supports ~ for home directory)"
+      },
+      "use_ai_summaries": {
+        "type": "boolean",
+        "description": "Use AI to generate symbol summaries. Supports Anthropic, Gemini, OpenAI-compatible endpoints, MiniMax, and GLM-5 via env vars. When false, uses docstrings or signature fallback.",
+        "default": true
+      },
+      "extra_ignore_patterns": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        },
+        "description": "Additional gitignore-style patterns to exclude from indexing (merged with JCODEMUNCH_EXTRA_IGNORE_PATTERNS env var)"
+      },
+      "follow_symlinks": {
+        "type": "boolean",
+        "description": "Whether to include symlinked files in indexing. Symlinked directories are never followed (prevents infinite loops from circular symlinks). Default false for security.",
+        "default": false
+      },
+      "incremental": {
+        "type": "boolean",
+        "description": "When true and an existing index exists, only re-index changed files.",
+        "default": true
+      }
+    },
+    "required": [
+      "path"
+    ]
+  }
+}

@@ -1,0 +1,23 @@
+{
+  "name": "get_layer_violations",
+  "description": "Check whether imports respect declared architectural layer boundaries. Reports every import that crosses a forbidden layer boundary. Layer rules can be passed directly or defined in .jcodemunch.jsonc under 'architecture.layers'. Use to enforce clean architecture and detect dependency-direction violations (e.g. API layer importing DB layer directly).",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "repo": {
+        "type": "string",
+        "description": "Repository identifier (owner/repo or just repo name)"
+      },
+      "rules": {
+        "type": "array",
+        "description": "Layer definitions. Each entry: {name, paths: [...], may_not_import: [...]}. If omitted, reads from .jcodemunch.jsonc architecture.layers.",
+        "items": {
+          "type": "object"
+        }
+      }
+    },
+    "required": [
+      "repo"
+    ]
+  }
+}

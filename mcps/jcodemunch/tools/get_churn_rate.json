@@ -1,0 +1,26 @@
+{
+  "name": "get_churn_rate",
+  "description": "Return git churn metrics for a file or symbol: commit count, unique authors, first_seen date, last_modified date, and churn_per_week over a configurable window. assessment: 'stable' (<=1/week), 'active' (<=3/week), 'volatile' (>3/week). Requires a locally indexed repo (index_folder); GitHub-indexed repos are not supported.",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "repo": {
+        "type": "string",
+        "description": "Repository identifier (owner/repo or just repo name)"
+      },
+      "target": {
+        "type": "string",
+        "description": "Relative file path (e.g. 'src/utils.py') or a full symbol ID."
+      },
+      "days": {
+        "type": "integer",
+        "description": "Look-back window in days (default 90).",
+        "default": 90
+      }
+    },
+    "required": [
+      "repo",
+      "target"
+    ]
+  }
+}

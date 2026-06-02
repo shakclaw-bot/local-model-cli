@@ -1,0 +1,26 @@
+{
+  "name": "get_dead_code_v2",
+  "description": "Find likely-dead functions and methods using three independent evidence signals: (1) the symbol's file is not reachable from any entry point via the import graph, (2) no indexed symbol calls this symbol in the call graph, (3) the symbol name is not re-exported from any __init__ or barrel file. Each result includes a confidence score (0.33 = 1 signal, 0.67 = 2 signals, 1.0 = all 3). More reliable than single-signal dead-code detection. Use min_confidence=0.67 for high-confidence results only.",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "repo": {
+        "type": "string",
+        "description": "Repository identifier (owner/repo or just repo name)"
+      },
+      "min_confidence": {
+        "type": "number",
+        "description": "Minimum confidence threshold 0.0–1.0 (default 0.5 = at least 2/3 signals).",
+        "default": 0.5
+      },
+      "include_tests": {
+        "type": "boolean",
+        "description": "Include test files in analysis (default false).",
+        "default": false
+      }
+    },
+    "required": [
+      "repo"
+    ]
+  }
+}

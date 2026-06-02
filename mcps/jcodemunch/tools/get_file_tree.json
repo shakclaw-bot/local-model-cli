@@ -1,0 +1,31 @@
+{
+  "name": "get_file_tree",
+  "description": "Get the file tree of an indexed repository, optionally filtered by path prefix. Results are capped at max_files (default 500) to prevent token overflow; use path_prefix to scope large trees.",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "repo": {
+        "type": "string",
+        "description": "Repository identifier (owner/repo or just repo name)"
+      },
+      "path_prefix": {
+        "type": "string",
+        "description": "Optional path prefix to filter (e.g., 'src/utils')",
+        "default": ""
+      },
+      "include_summaries": {
+        "type": "boolean",
+        "description": "Include file-level summaries in the tree nodes",
+        "default": false
+      },
+      "max_files": {
+        "type": "integer",
+        "description": "Maximum number of files to return (default 500). When truncated, response includes total_file_count and a hint to use path_prefix.",
+        "default": 500
+      }
+    },
+    "required": [
+      "repo"
+    ]
+  }
+}

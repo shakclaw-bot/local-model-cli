@@ -1,0 +1,17 @@
+{
+  "name": "audit_agent_config",
+  "description": "Audit agent configuration files (CLAUDE.md, .cursorrules, copilot-instructions.md, etc.) for token waste. Reports per-file token cost, stale symbol references, dead file paths, redundancy between global and project configs, bloat patterns, and scope leaks. Cross-references against the jcodemunch index to catch references to renamed or deleted symbols and files that no other linter can detect.",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "repo": {
+        "type": "string",
+        "description": "Repository identifier for cross-referencing symbols and files. If omitted, skips stale-reference and dead-path checks."
+      },
+      "project_path": {
+        "type": "string",
+        "description": "Project directory to scan for config files. Defaults to cwd."
+      }
+    }
+  }
+}

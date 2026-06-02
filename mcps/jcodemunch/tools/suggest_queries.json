@@ -1,0 +1,16 @@
+{
+  "name": "suggest_queries",
+  "description": "Suggest search queries, entry-point files, and index stats. Good first call on an unfamiliar repo — surfaces most-imported files, top keywords, and ready-to-run example queries.",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "repo": {
+        "type": "string",
+        "description": "Repository identifier (owner/repo or just repo name)"
+      }
+    },
+    "required": [
+      "repo"
+    ]
+  }
+}

@@ -1,0 +1,64 @@
+{
+  "name": "get_context_bundle",
+  "description": "Get full source + imports for one or more symbols in one call. Multi-symbol bundles deduplicate shared imports. Set token_budget to cap response size; use budget_strategy to control what's kept. Supports fqn (PHP FQN via PSR-4) as alternative to symbol_id.",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "repo": {
+        "type": "string",
+        "description": "Repository identifier (owner/repo or just repo name)"
+      },
+      "symbol_id": {
+        "type": "string",
+        "description": "Single symbol ID (backward-compatible). Use symbol_ids for multi-symbol bundles."
+      },
+      "symbol_ids": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        },
+        "description": "List of symbol IDs for a multi-symbol bundle. Imports are deduplicated across symbols that share a file."
+      },
+      "include_callers": {
+        "type": "boolean",
+        "description": "When true, each symbol entry includes a 'callers' list of files that directly import its defining file.",
+        "default": false
+      },
+      "output_format": {
+        "type": "string",
+        "description": "'json' (default) or 'markdown' — markdown renders a paste-ready document with imports, docstrings, and source blocks.",
+        "enum": [
+          "json",
+          "markdown"
+        ],
+        "default": "json"
+      },
+      "token_budget": {
+        "type": "integer",
+        "description": "Max tokens to return. When set, symbols are ranked and trimmed to fit. Uses budget_strategy to prioritize."
+      },
+      "budget_strategy": {
+        "type": "string",
+        "enum": [
+          "most_relevant",
+          "core_first",
+          "compact"
+        ],
+        "description": "'most_relevant' (default) ranks by file centrality (import in-degree). 'core_first' keeps the primary symbol first, ranks rest by centrality. 'compact' strips source bodies — returns signatures only.",
+        "default": "most_relevant"
+      },
+      "include_budget_report": {
+        "type": "boolean",
+        "description": "When true, include a 'budget_report' field showing tokens used, symbols included/excluded, and strategy applied.",
+        "default": false
+      },
+      "fqn": {
+        "type": "string",
+        "description": "PHP fully-qualified class name (e.g. 'App\\Models\\User'). Resolves to symbol_id via PSR-4. Alternative to symbol_id."
+      }
+    },
+    "required": [
+      "repo"
+    ]
+  }
+}

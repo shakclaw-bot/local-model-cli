@@ -1,0 +1,21 @@
+{
+  "name": "get_symbol_diff",
+  "description": "Diff symbol sets between two indexed snapshots. Shows added, removed, and changed symbols. Branch workflow: index branch A as repo-main, index branch B as repo-feature, then diff.",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "repo_a": {
+        "type": "string",
+        "description": "First repo identifier (the 'before' snapshot)"
+      },
+      "repo_b": {
+        "type": "string",
+        "description": "Second repo identifier (the 'after' snapshot)"
+      }
+    },
+    "required": [
+      "repo_a",
+      "repo_b"
+    ]
+  }
+}

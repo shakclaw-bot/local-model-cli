@@ -1,0 +1,33 @@
+{
+  "name": "index_repo",
+  "description": "Index a GitHub repository's source code. Fetches files, parses ASTs, extracts symbols, and saves to local storage. Set JCODEMUNCH_USE_AI_SUMMARIES=false to disable AI summaries globally.",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "url": {
+        "type": "string",
+        "description": "GitHub repository URL or owner/repo string"
+      },
+      "use_ai_summaries": {
+        "type": "boolean",
+        "description": "Use AI to generate symbol summaries. Supports Anthropic, Gemini, OpenAI-compatible endpoints, MiniMax, and GLM-5 via env vars. When false, uses docstrings or signature fallback.",
+        "default": true
+      },
+      "extra_ignore_patterns": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        },
+        "description": "Additional gitignore-style patterns to exclude from indexing (merged with JCODEMUNCH_EXTRA_IGNORE_PATTERNS env var)"
+      },
+      "incremental": {
+        "type": "boolean",
+        "description": "When true and an existing index exists, only re-index changed files.",
+        "default": true
+      }
+    },
+    "required": [
+      "url"
+    ]
+  }
+}

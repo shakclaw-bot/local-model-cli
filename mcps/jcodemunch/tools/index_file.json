@@ -1,0 +1,26 @@
+{
+  "name": "index_file",
+  "description": "Index a single file within an existing index. Faster than index_folder for surgical updates after editing a file. The file must be within an already-indexed folder's source_root. Can also add new files not yet in the index.",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "path": {
+        "type": "string",
+        "description": "Absolute path to the file to index"
+      },
+      "use_ai_summaries": {
+        "type": "boolean",
+        "description": "Use AI to generate symbol summaries. Supports Anthropic, Gemini, OpenAI-compatible endpoints, MiniMax, and GLM-5 via env vars. When false, uses docstrings or signature fallback.",
+        "default": true
+      },
+      "context_providers": {
+        "type": "boolean",
+        "description": "Whether to run context providers",
+        "default": true
+      }
+    },
+    "required": [
+      "path"
+    ]
+  }
+}

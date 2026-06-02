@@ -1,0 +1,31 @@
+{
+  "name": "get_extraction_candidates",
+  "description": "Identify functions in a file that are good candidates for extraction to a shared module. A candidate must have high cyclomatic complexity (doing a lot) AND be called from multiple other files (already implicitly shared). Results are ranked by score = complexity × caller_file_count. Requires re-indexing with jcodemunch-mcp >= 1.16 to populate complexity data.",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "repo": {
+        "type": "string",
+        "description": "Repository identifier (owner/repo or just repo name)"
+      },
+      "file_path": {
+        "type": "string",
+        "description": "Relative file path within the repo (e.g. 'src/utils.py')."
+      },
+      "min_complexity": {
+        "type": "integer",
+        "description": "Minimum cyclomatic complexity threshold (default 5).",
+        "default": 5
+      },
+      "min_callers": {
+        "type": "integer",
+        "description": "Minimum number of distinct caller files (default 2).",
+        "default": 2
+      }
+    },
+    "required": [
+      "repo",
+      "file_path"
+    ]
+  }
+}

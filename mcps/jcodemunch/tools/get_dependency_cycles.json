@@ -1,0 +1,16 @@
+{
+  "name": "get_dependency_cycles",
+  "description": "Detect circular import chains in a repository. Returns every strongly-connected component (set of files that mutually import each other, directly or transitively). Run this to identify architectural problems before a refactor, or to understand why a module is hard to test in isolation.",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "repo": {
+        "type": "string",
+        "description": "Repository identifier (owner/repo or just repo name)"
+      }
+    },
+    "required": [
+      "repo"
+    ]
+  }
+}

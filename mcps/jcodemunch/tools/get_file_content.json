@@ -1,0 +1,29 @@
+{
+  "name": "get_file_content",
+  "description": "Get cached source for a file, optionally sliced to a line range.",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "repo": {
+        "type": "string",
+        "description": "Repository identifier (owner/repo or just repo name)"
+      },
+      "file_path": {
+        "type": "string",
+        "description": "Path to the file within the repository (e.g., 'src/main.py')"
+      },
+      "start_line": {
+        "type": "integer",
+        "description": "Optional 1-based start line (inclusive)"
+      },
+      "end_line": {
+        "type": "integer",
+        "description": "Optional 1-based end line (inclusive)"
+      }
+    },
+    "required": [
+      "repo",
+      "file_path"
+    ]
+  }
+}

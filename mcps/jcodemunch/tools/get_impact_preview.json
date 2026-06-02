@@ -1,0 +1,21 @@
+{
+  "name": "get_impact_preview",
+  "description": "Show what breaks if a symbol is removed or renamed. Walks the call graph transitively to find every symbol that calls this one, returning affected symbols grouped by file with call-chain paths. Use this before deleting or renaming a symbol to understand full impact. For a structured caller/callee tree, use get_call_hierarchy instead.",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "repo": {
+        "type": "string",
+        "description": "Repository identifier (owner/repo or just repo name)"
+      },
+      "symbol_id": {
+        "type": "string",
+        "description": "Symbol name or full ID to analyse. Use search_symbols to find IDs."
+      }
+    },
+    "required": [
+      "repo",
+      "symbol_id"
+    ]
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "name": "get_session_stats",
+  "description": "Get token savings stats for the current MCP session. Returns tokens saved and cost avoided (this session and all-time), per-tool breakdown, session duration, and cumulative totals. Use to see how much jCodeMunch has saved you.",
+  "inputSchema": {
+    "type": "object",
+    "properties": {}
+  }
+}

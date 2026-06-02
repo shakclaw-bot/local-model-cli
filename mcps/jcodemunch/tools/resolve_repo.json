@@ -1,0 +1,16 @@
+{
+  "name": "resolve_repo",
+  "description": "Resolve a filesystem path to its indexed repo identifier. O(1) lookup — faster than list_repos for finding a single repo. Accepts repo root, worktree, subdirectory, or file path.",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "path": {
+        "type": "string",
+        "description": "Absolute filesystem path (repo root, worktree, subdirectory, or file)"
+      }
+    },
+    "required": [
+      "path"
+    ]
+  }
+}

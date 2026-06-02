@@ -1,0 +1,27 @@
+{
+  "name": "get_file_outline",
+  "description": "Get all symbols (functions, classes, methods) in a file with full signatures (including parameter names) and summaries. Use signatures to review naming at parameter granularity without reading the full file. Pass repo and file_path (e.g. 'src/main.py').",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "repo": {
+        "type": "string",
+        "description": "Repository identifier (owner/repo or just repo name)"
+      },
+      "file_path": {
+        "type": "string",
+        "description": "Path to the file within the repository (e.g., 'src/main.py')"
+      },
+      "file_paths": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        },
+        "description": "List of file paths to query in batch mode. Returns a grouped results array."
+      }
+    },
+    "required": [
+      "repo"
+    ]
+  }
+}

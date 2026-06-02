@@ -1,0 +1,13 @@
+{
+  "name": "get_cross_repo_map",
+  "description": "Return which indexed repos depend on which other indexed repos at the package level. Shows the full cross-repository dependency map based on package names extracted from manifest files (pyproject.toml, package.json, go.mod, Cargo.toml, etc.). Use to visualize how your indexed repos are interconnected. Pass repo to filter to a single repo's perspective.",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "repo": {
+        "type": "string",
+        "description": "Optional repo ID to filter. If omitted, returns the full cross-repo map."
+      }
+    }
+  }
+}
