@@ -19,7 +19,7 @@ Usage:
 from __future__ import annotations
 import argparse, concurrent.futures, ipaddress, json, os, platform, re, signal, shutil
 import socket, struct, subprocess, sys
-import textwrap, time, urllib.request, urllib.error
+import textwrap, time, urllib.parse, urllib.request, urllib.error
 from pathlib import Path
 
 
@@ -357,14 +357,49 @@ def _default_scan_targets():
     return targets
 
 
+def _split_scan_target(target):
+    if target.startswith(("http://", "https://")):
+        parsed = urllib.parse.urlparse(target)
+        if not parsed.hostname:
+            raise ValueError(f"invalid target '{target}'")
+        return parsed.hostname, parsed.port
+
+    if "/" in target:
+        return target, None
+
+    if target.startswith("[") and "]" in target:
+        host, _, rest = target[1:].partition("]")
+        if rest.startswith(":") and rest[1:].isdigit():
+            return host, int(rest[1:])
+        return host, None
+
+    host, sep, port_text = target.rpartition(":")
+    if sep and host and port_text.isdigit():
+        return host, int(port_text)
+    return target, None
+
+
+def _validate_scan_port(port):
+    if port < 1 or port > 65535:
+        raise ValueError(f"port out of range: {port}")
+    return port
+
+
 def _expand_scan_targets(targets):
-    seen = set()
+    seen_hosts = set()
+    seen_pairs = set()
     hosts = []
+    explicit_pairs = []
     for target in targets:
         target = (target or "").strip()
         if not target:
             continue
+        target, target_port = _split_scan_target(target)
+        if target_port is not None:
+            target_port = _validate_scan_port(target_port)
         if "/" in target:
+            if target_port is not None:
+                raise ValueError(f"ports are not supported on network targets: {target}")
             try:
                 net = ipaddress.ip_network(target, strict=False)
             except ValueError as exc:
@@ -372,13 +407,18 @@ def _expand_scan_targets(targets):
             iterable = net.hosts() if net.num_addresses > 2 else net
             for addr in iterable:
                 host = str(addr)
-                if host not in seen:
-                    seen.add(host)
+                if host not in seen_hosts:
+                    seen_hosts.add(host)
                     hosts.append(host)
-        elif target not in seen:
-            seen.add(target)
+        elif target_port is not None:
+            pair = (target, target_port)
+            if pair not in seen_pairs:
+                seen_pairs.add(pair)
+                explicit_pairs.append(pair)
+        elif target not in seen_hosts:
+            seen_hosts.add(target)
             hosts.append(target)
-    return hosts
+    return hosts, explicit_pairs
 
 
 def _models_from_payload(payload):
@@ -2782,29 +2822,38 @@ def _interactive_scan_selection(choices, existing):
 def cmd_scan(args):
     try:
         ports = _parse_port_list(args.ports)
-        hosts = _expand_scan_targets(args.target or _default_scan_targets())
+        hosts, explicit_pairs = _expand_scan_targets(args.target or _default_scan_targets())
     except ValueError as exc:
         print(f"scan: {exc}", file=sys.stderr)
         sys.exit(1)
 
-    if not hosts:
+    if not hosts and not explicit_pairs:
         print("scan: no hosts to scan", file=sys.stderr)
         sys.exit(1)
-    if len(hosts) > args.max_hosts:
-        print(f"scan: refusing to scan {len(hosts)} hosts (limit {args.max_hosts})",
+    total_targets = len(hosts) + len({host for host, _port in explicit_pairs})
+    if total_targets > args.max_hosts:
+        print(f"scan: refusing to scan {total_targets} hosts (limit {args.max_hosts})",
               file=sys.stderr)
         print("Use --max-hosts N or a narrower --target.", file=sys.stderr)
         sys.exit(1)
 
-    print(f"Scanning {len(hosts)} host(s) x {len(ports)} port(s) for /v1/models...")
+    probe_pairs = list(explicit_pairs)
+    seen_pairs = set(probe_pairs)
+    for host in hosts:
+        for port in ports:
+            pair = (host, port)
+            if pair not in seen_pairs:
+                seen_pairs.add(pair)
+                probe_pairs.append(pair)
+
+    print(f"Scanning {len(probe_pairs)} endpoint(s) for /v1/models...")
 
     found = []
-    workers = max(1, min(args.workers, len(hosts) * len(ports)))
+    workers = max(1, min(args.workers, len(probe_pairs)))
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
         futures = [
             pool.submit(_probe_openai_models, host, port, args.timeout)
-            for host in hosts
-            for port in ports
+            for host, port in probe_pairs
         ]
         for future in concurrent.futures.as_completed(futures):
             try:
@@ -3270,7 +3319,7 @@ def main():
 
     p = sub.add_parser("scan", help="Scan the LAN for OpenAI-compatible model servers")
     p.add_argument("--target", action="append",
-                   help="Host, IP, or CIDR to scan (repeatable; default localhost + LAN /24)")
+                   help="Host, host:port, URL, or CIDR to scan (repeatable; default localhost + LAN /24)")
     p.add_argument("--ports", default="8080,8000,11434,1234,5000,5001,8880,8808",
                    help="Comma-separated ports/ranges to scan")
     p.add_argument("--timeout", type=float, default=0.35,

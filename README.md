@@ -247,6 +247,7 @@ local-model edit gemma4
 ```bash
 local-model scan
 local-model scan --target 100.64.0.0/24 --ports 8080,8000,11434
+local-model scan --target 192.168.1.25:8080
 local-model scan --register
 ```
 
@@ -268,7 +269,7 @@ local-model serve bonsai --lan
 # prints, for example: http://192.168.1.25:8080/v1
 
 # On the laptop:
-local-model scan --target 192.168.1.25 --ports 8080
+local-model scan --target 192.168.1.25:8080
 local-model start qwen3.6-35b
 ```
 
