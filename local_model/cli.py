@@ -7,6 +7,7 @@ Usage:
   local-model stop <model|all>            Stop a running model server
   local-model status                      Show running servers with health + memory
   local-model monitor                     Show RAM/VRAM attribution bars
+  local-model scan                        Scan the LAN for served models
   local-model test <model> [--prompts N]  Run quality tests against a running model
   local-model bench <model> [--ctx N]     Run speed benchmark
   local-model add <path|hf-repo> [name]   Register a new GGUF model
@@ -14,7 +15,8 @@ Usage:
   local-model config                      Show / edit configuration
 """
 from __future__ import annotations
-import argparse, json, os, platform, re, signal, shutil, struct, subprocess, sys
+import argparse, concurrent.futures, ipaddress, json, os, platform, re, signal, shutil
+import socket, struct, subprocess, sys
 import textwrap, time, urllib.request, urllib.error
 from pathlib import Path
 
@@ -266,6 +268,130 @@ def _normalize_remote_url(u):
     if not u.endswith("/v1"):
         u = u + "/v1"
     return u
+
+
+def _parse_port_list(text):
+    ports = []
+    for part in (text or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            start, _, end = part.partition("-")
+            try:
+                first, last = int(start), int(end)
+            except ValueError:
+                raise ValueError(f"invalid port range '{part}'")
+            if first > last:
+                first, last = last, first
+            values = range(first, last + 1)
+        else:
+            try:
+                values = [int(part)]
+            except ValueError:
+                raise ValueError(f"invalid port '{part}'")
+        for port in values:
+            if port < 1 or port > 65535:
+                raise ValueError(f"port out of range: {port}")
+            if port not in ports:
+                ports.append(port)
+    if not ports:
+        raise ValueError("at least one port is required")
+    return ports
+
+
+def _local_lan_cidr():
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect(("8.8.8.8", 80))
+            host = s.getsockname()[0]
+        finally:
+            s.close()
+        if host and not host.startswith("127."):
+            return f"{host}/24"
+    except Exception:
+        pass
+    return None
+
+
+def _default_scan_targets():
+    targets = ["127.0.0.1"]
+    lan = _local_lan_cidr()
+    if lan:
+        targets.append(lan)
+    return targets
+
+
+def _expand_scan_targets(targets):
+    seen = set()
+    hosts = []
+    for target in targets:
+        target = (target or "").strip()
+        if not target:
+            continue
+        if "/" in target:
+            try:
+                net = ipaddress.ip_network(target, strict=False)
+            except ValueError as exc:
+                raise ValueError(f"invalid network target '{target}': {exc}")
+            iterable = net.hosts() if net.num_addresses > 2 else net
+            for addr in iterable:
+                host = str(addr)
+                if host not in seen:
+                    seen.add(host)
+                    hosts.append(host)
+        elif target not in seen:
+            seen.add(target)
+            hosts.append(target)
+    return hosts
+
+
+def _models_from_payload(payload):
+    if not isinstance(payload, dict):
+        return []
+    data = payload.get("data")
+    if data is None:
+        data = payload.get("models")
+    if not isinstance(data, list):
+        return []
+    models = []
+    for item in data:
+        if isinstance(item, dict):
+            model_id = item.get("id") or item.get("name") or item.get("model")
+        else:
+            model_id = item
+        if model_id:
+            models.append(str(model_id))
+    return models
+
+
+def _probe_openai_models(host, port, timeout):
+    base = f"http://{host}:{port}/v1"
+    payload = _http_json(base + "/models", timeout=timeout)
+    models = _models_from_payload(payload)
+    if not models:
+        return None
+    return {
+        "host": host,
+        "port": port,
+        "url": base,
+        "models": models,
+    }
+
+
+def _safe_key(value, fallback="remote"):
+    key = re.sub(r"[^a-z0-9._-]+", "-", str(value).lower()).strip("-._")
+    return key or fallback
+
+
+def _unique_key(registry, base_key):
+    key = base_key
+    i = 2
+    while key in registry:
+        key = f"{base_key}-{i}"
+        i += 1
+    return key
 
 
 def check_health(port, timeout=3):
@@ -2371,12 +2497,7 @@ def cmd_add_remote(args):
     registry = load_registry()
     url = _normalize_remote_url(args.url)
     name = args.name or "remote model"
-    base_key = (args.name or "remote").lower().replace(" ", "-")
-    key = base_key
-    i = 2
-    while key in registry:
-        key = f"{base_key}-{i}"
-        i += 1
+    key = _unique_key(registry, _safe_key(args.name or "remote"))
     registry[key] = {
         "name": name,
         "remote": True,
@@ -2393,6 +2514,102 @@ def cmd_add_remote(args):
     print(f"  reachable: {'yes' if reachable else 'no (remote down or Tailscale off)'}")
     print(f"\nVerify with: local-model start {key}")
     print(f"Use it by pointing your client at: {url}")
+
+
+def cmd_scan(args):
+    try:
+        ports = _parse_port_list(args.ports)
+        hosts = _expand_scan_targets(args.target or _default_scan_targets())
+    except ValueError as exc:
+        print(f"scan: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    if not hosts:
+        print("scan: no hosts to scan", file=sys.stderr)
+        sys.exit(1)
+    if len(hosts) > args.max_hosts:
+        print(f"scan: refusing to scan {len(hosts)} hosts (limit {args.max_hosts})",
+              file=sys.stderr)
+        print("Use --max-hosts N or a narrower --target.", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"Scanning {len(hosts)} host(s) x {len(ports)} port(s) for /v1/models...")
+
+    found = []
+    workers = max(1, min(args.workers, len(hosts) * len(ports)))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [
+            pool.submit(_probe_openai_models, host, port, args.timeout)
+            for host in hosts
+            for port in ports
+        ]
+        for future in concurrent.futures.as_completed(futures):
+            try:
+                item = future.result()
+            except Exception:
+                item = None
+            if item:
+                found.append(item)
+
+    def _sort_key(item):
+        try:
+            host_key = ipaddress.ip_address(item["host"])
+        except ValueError:
+            host_key = item["host"]
+        return str(host_key), item["port"]
+
+    found.sort(key=_sort_key)
+    if not found:
+        print("No OpenAI-compatible model endpoints found.")
+        return
+
+    registry = load_registry()
+    existing_urls = {
+        _normalize_remote_url(cfg.get("url", ""))
+        for cfg in registry.values()
+        if _is_remote(cfg) and cfg.get("url")
+    }
+    registered = []
+
+    print(f"\n{'Endpoint':<28} {'Models'}")
+    print("-" * 80)
+    for item in found:
+        models = ", ".join(item["models"][:4])
+        if len(item["models"]) > 4:
+            models += f", +{len(item['models']) - 4} more"
+        print(f"{item['url']:<28} {models}")
+
+        if not args.register:
+            continue
+
+        url = _normalize_remote_url(item["url"])
+        if url in existing_urls:
+            registered.append((url, "already registered"))
+            continue
+        model_name = item["models"][0] if item["models"] else f"{item['host']}:{item['port']}"
+        key = _unique_key(registry, _safe_key(model_name))
+        registry[key] = {
+            "name": model_name,
+            "remote": True,
+            "url": url,
+            "context": args.context,
+            "models": item["models"],
+            "notes": f"Discovered by network scan at {item['host']}:{item['port']}",
+        }
+        existing_urls.add(url)
+        registered.append((url, key))
+
+    if args.register:
+        if any(key != "already registered" for _url, key in registered):
+            save_registry(registry)
+        print("\nRegistration:")
+        for url, key in registered:
+            if key == "already registered":
+                print(f"  {url}: already registered")
+            else:
+                print(f"  {url}: registered as '{key}'")
+    else:
+        print("\nRegister discovered endpoints with: local-model scan --register")
 
 
 def _tailscale_bin():
@@ -2556,6 +2773,7 @@ def cmd_help(args):
     print(f"  {'stop <model|all>':<30} Stop a running model server")
     print(f"  {'status':<30} Show running servers with health info")
     print(f"  {'monitor [--once]':<30} Show RAM/VRAM attribution bars")
+    print(f"  {'scan [--register]':<30} Scan the LAN for OpenAI-compatible models")
     print(f"  {'test <model> [--prompts N]':<30} Run quality tests (reasoning, coding, factual)")
     print(f"  {'bench <model> [--ctx N]':<30} Run speed benchmark at multiple context sizes")
     print(f"  {'eval <model> [--questions N]':<30} Accuracy eval (GSM8K reasoning + needle)")
@@ -2599,6 +2817,7 @@ def main():
               local-model start bonsai                      Start a model server
               local-model stop all                          Stop all running servers
               local-model monitor --once                     Show RAM/VRAM attribution bars
+              local-model scan --register                    Find and register LAN model servers
               local-model test bonsai                       Run quality tests
               local-model bench bonsai                      Run speed benchmark
               local-model config --set-backend default /usr/local/bin/llama-server
@@ -2627,6 +2846,22 @@ def main():
     p = sub.add_parser("monitor", help="Show RAM/VRAM attribution bars")
     p.add_argument("--interval", type=float, default=2.0, help="Refresh interval seconds")
     p.add_argument("--once", action="store_true", help="Print one frame and exit")
+
+    p = sub.add_parser("scan", help="Scan the LAN for OpenAI-compatible model servers")
+    p.add_argument("--target", action="append",
+                   help="Host, IP, or CIDR to scan (repeatable; default localhost + LAN /24)")
+    p.add_argument("--ports", default="8080,8000,11434,1234,5000,5001,8880,8808",
+                   help="Comma-separated ports/ranges to scan")
+    p.add_argument("--timeout", type=float, default=0.35,
+                   help="HTTP timeout per endpoint in seconds")
+    p.add_argument("--workers", type=int, default=64,
+                   help="Concurrent probes")
+    p.add_argument("--max-hosts", type=int, default=512,
+                   help="Safety limit for expanded targets")
+    p.add_argument("--register", action="store_true",
+                   help="Register discovered endpoints as remote models")
+    p.add_argument("--context", type=int, default=8192,
+                   help="Context window used for registrations")
 
     p = sub.add_parser("test", help="Run quality tests against a running model")
     p.add_argument("model", help="Model name")
@@ -2694,6 +2929,7 @@ def main():
         "stop": cmd_stop,
         "status": cmd_status,
         "monitor": cmd_monitor,
+        "scan": cmd_scan,
         "test": cmd_test,
         "bench": cmd_bench,
         "eval": cmd_eval,

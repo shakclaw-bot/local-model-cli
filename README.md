@@ -135,6 +135,7 @@ Example `bench` output:
 | `local-model start <model> [--ctx N]` | Start a model server |
 | `local-model stop <model\|all>` | Stop running server(s) |
 | `local-model status` | Show running servers with health and slot info |
+| `local-model scan [--register]` | Scan localhost and the LAN for OpenAI-compatible `/v1/models` endpoints |
 | `local-model edit <model> [flags]` | Edit settings (name, port, context, runtime args, `--rename-key`); no flags = inspector |
 | `local-model bench <model> [--ctx N] [--iters N]` | Speed benchmark: streaming TTFT + decode tok/s (p50/p90) |
 | `local-model eval <model> [--questions N]` | Accuracy eval: GSM8K reasoning + needle retrieval (auto-scored) |
@@ -220,6 +221,18 @@ local-model edit gemma4
 ```
 
 `--server-args` replaces the existing list and is parsed with shell-style quoting. Editing a running model warns you that changes take effect on next start.
+
+## Network discovery
+
+`local-model scan` probes common model-server ports on localhost and your current `/24` LAN for OpenAI-compatible `/v1/models` endpoints:
+
+```bash
+local-model scan
+local-model scan --target 100.64.0.0/24 --ports 8080,8000,11434
+local-model scan --register
+```
+
+By default, scanning is read-only. Add `--register` to save each discovered endpoint as a remote model in `~/.local-model/registry.json`; duplicate remote URLs are skipped.
 
 ## VRAM auto-sizing for MoE models (`auto_ncmoe`)
 
