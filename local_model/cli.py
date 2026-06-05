@@ -848,13 +848,81 @@ def _port_owner_pid(port):
     return None
 
 
-def _discover_ollama():
+def _looks_like_ollama_process(proc):
+    name = (proc.get("name") or "").lower()
+    cmd = (proc.get("cmd") or "").lower()
+    return (
+        name.startswith("ollama")
+        or "ollama_llama" in name
+        or "ollama.exe" in cmd
+        or "ollama app.exe" in cmd
+        or "ollama_llama" in cmd
+        or "\\ollama\\runners\\" in cmd
+        or "/ollama/runners/" in cmd
+    )
+
+
+def _looks_like_ollama_server(proc):
+    name = (proc.get("name") or "").lower()
+    cmd = (proc.get("cmd") or "").lower()
+    return "ollama.exe" in name and " serve" in cmd
+
+
+def _looks_like_ollama_runner(proc):
+    if not _looks_like_ollama_process(proc):
+        return False
+    name = (proc.get("name") or "").lower()
+    cmd = (proc.get("cmd") or "").lower()
+    if "ollama app" in name or "ollama app" in cmd:
+        return False
+    if _looks_like_ollama_server(proc):
+        return False
+    return (
+        "ollama_llama" in name
+        or "ollama_llama" in cmd
+        or "\\ollama\\runners\\" in cmd
+        or "/ollama/runners/" in cmd
+        or re.search(r"\bollama(\.exe)?\s+runner\b", cmd) is not None
+    )
+
+
+def _ollama_processes(processes=None):
+    processes = processes or _process_snapshots()
+    return [p for p in processes.values() if _looks_like_ollama_process(p)]
+
+
+def _ollama_server_process(processes=None):
+    processes = processes or _process_snapshots()
+    for proc in _ollama_processes(processes):
+        if _looks_like_ollama_server(proc):
+            return proc
+    pid = _port_owner_pid(11434)
+    return processes.get(pid) if pid else None
+
+
+def _ollama_runner_for_model(model_name, meta, runners):
+    model_l = (model_name or "").lower()
+    digest = str(meta.get("digest") or "").lower()
+    digest_bits = [digest, digest[:16], digest[:12]] if digest else []
+    for proc in runners:
+        cmd = (proc.get("cmd") or "").lower()
+        if model_l and model_l in cmd:
+            return proc
+        if any(bit and bit in cmd for bit in digest_bits):
+            return proc
+    return runners[0] if len(runners) == 1 else None
+
+
+def _discover_ollama(processes=None):
     tags = _http_json(OLLAMA_URL + "/api/tags") or {}
     ps = _http_json(OLLAMA_URL + "/api/ps") or {}
     installed = {m.get("name") or m.get("model"): m
                  for m in tags.get("models", []) if m.get("name") or m.get("model")}
     running = {m.get("name") or m.get("model"): m
                for m in ps.get("models", []) if m.get("name") or m.get("model")}
+    processes = processes or _process_snapshots()
+    runners = [p for p in _ollama_processes(processes) if _looks_like_ollama_runner(p)]
+    server_proc = _ollama_server_process(processes) if running else None
     rows = []
     for name in sorted(set(installed) | set(running)):
         meta = running.get(name) or installed.get(name) or {}
@@ -865,6 +933,11 @@ def _discover_ollama():
         display = name
         if family or q:
             display += f" ({'/'.join(x for x in [family, q] if x)})"
+        proc = None
+        if name in running:
+            proc = _ollama_runner_for_model(name, meta, runners)
+            if not proc and len(running) == 1:
+                proc = server_proc
         rows.append({
             "key": f"ollama:{name}",
             "source": "ollama",
@@ -873,8 +946,9 @@ def _discover_ollama():
             "port": 11434,
             "context": ctx,
             "size": meta.get("size"),
-            "ram": None,
+            "ram": proc.get("rss") if proc else None,
             "vram": meta.get("size_vram") if name in running else None,
+            "pid": proc.get("pid") if proc else None,
             "status": "running" if name in running else "available",
         })
     return rows
@@ -1186,7 +1260,7 @@ def _discover_voxcpm(processes=None, fast=False):
 
 
 def _external_rows(processes=None, fast=False):
-    return (_discover_ollama() + _discover_whisper(processes)
+    return (_discover_ollama(processes) + _discover_whisper(processes)
             + _discover_kokoro(processes, fast=fast)
             + _discover_bonsai_image(processes, fast=fast)
             + _discover_voxcpm(processes, fast=fast))
