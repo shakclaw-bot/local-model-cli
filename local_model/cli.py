@@ -12,7 +12,7 @@ Usage:
   local-model info <model>                Show model details (arch, params, quant, ctx)
 """
 from __future__ import annotations
-import argparse, json, os, signal, subprocess, sys, textwrap, time, urllib.request, urllib.error
+import argparse, json, os, re, signal, subprocess, sys, textwrap, time, urllib.request, urllib.error
 from pathlib import Path
 
 ROOT = Path.home() / ".openclaw/workspace"
@@ -282,10 +282,25 @@ def _get_bench_speeds(key):
     return None, None
 
 
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _visible_len(value) -> int:
+    return len(_ANSI_RE.sub("", str(value)))
+
+
+def _pad(value, width: int, align: str = "<") -> str:
+    """Pad while ignoring ANSI colour sequences in the visible width."""
+    text = str(value)
+    pad = max(0, width - _visible_len(text))
+    if align == ">":
+        return " " * pad + text
+    return text + " " * pad
+
+
 def cmd_list(args):
     registry = load_registry()
-    print(f"{'Model':<16} {'Name':<26} {'Port':>5} {'Context':>8} {'tok/s in':>9} {'tok/s out':>9} {'Status':<10}")
-    print("-" * 90)
+    rows = []
     for key, cfg in sorted(registry.items()):
         port = cfg.get("port", "?")
         ctx = cfg.get("context", "?")
@@ -310,7 +325,31 @@ def cmd_list(args):
         if not model_path and not cfg.get("source", "").startswith("ollama:"):
             status = "\033[31mmissing\033[0m"
 
-        print(f"{key:<16} {cfg.get('name', '?'):<26} {port:>5} {ctx_str:>8} {in_str:>9} {out_str:>9} {status}")
+        rows.append([
+            key,
+            cfg.get("name", "?"),
+            str(port),
+            ctx_str,
+            in_str,
+            out_str,
+            status,
+        ])
+
+    headers = ["Model", "Name", "Port", "Context", "tok/s in", "tok/s out", "Status"]
+    aligns = ["<", "<", ">", ">", ">", ">", "<"]
+    widths = []
+    for idx, header in enumerate(headers):
+        values = [row[idx] for row in rows]
+        widths.append(max(_visible_len(header), *( _visible_len(v) for v in values)) if values else _visible_len(header))
+
+    def fmt(row):
+        return "  ".join(_pad(value, widths[idx], aligns[idx]) for idx, value in enumerate(row))
+
+    header_line = fmt(headers)
+    print(header_line)
+    print("-" * _visible_len(header_line))
+    for row in rows:
+        print(fmt(row))
 
 
 def _build_server_cmd(cfg, binary, model_path, port, ctx):
