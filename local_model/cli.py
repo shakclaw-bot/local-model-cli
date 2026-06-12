@@ -246,6 +246,10 @@ def _is_remote(cfg):
     return bool(cfg.get("remote"))
 
 
+def _is_inactive(cfg):
+    return cfg.get("active") is False or cfg.get("inactive") is True
+
+
 def _model_endpoint(cfg):
     """OpenAI base URL (.../v1) for a model: remote 'url' if set, else local port."""
     if _is_remote(cfg) and cfg.get("url"):
@@ -581,6 +585,7 @@ KOKORO_MODEL = KOKORO_ROOT / "api" / "src" / "models" / "v1_0" / "kokoro-v1_0.pt
 KOKORO_DEFAULT_PORT = 8880
 BONSAI_IMAGE_ROOT = Path(os.environ.get("BONSAI_IMAGE_ROOT", r"X:\Local-Model\bonsai-image-gemlite"))
 BONSAI_IMAGE_DEFAULT_PORT = 8000
+Z_IMAGE_MODEL_ID = os.environ.get("Z_IMAGE_MODEL_ID", "Tongyi-MAI/Z-Image-Turbo")
 VOXCPM_ROOT = Path(os.environ.get("VOXCPM_ROOT", r"X:\Local-Model\VoxCPM"))
 VOXCPM_MODEL_DIR = Path(os.environ.get("VOXCPM_MODEL_PATH", r"X:\Local-Model\models\openbmb__VoxCPM2"))
 VOXCPM_DEFAULT_PORT = 8808
@@ -1186,6 +1191,39 @@ def _discover_bonsai_image(processes=None, fast=False):
     }]
 
 
+def _looks_like_z_image_process(proc):
+    cmd = (proc.get("cmd") or "").lower()
+    return (
+        "z_image_generate.py" in cmd
+        or "generate-z-image.ps1" in cmd
+        or "z-image-turbo" in cmd
+        or Z_IMAGE_MODEL_ID.lower() in cmd
+    )
+
+
+def _discover_z_image(processes=None, fast=False):
+    processes = processes or _process_snapshots()
+    proc = _pick_likely_model_process(
+        [p for p in processes.values() if _looks_like_z_image_process(p)]
+    )
+    if not proc:
+        return []
+
+    return [{
+        "key": "z-image:z-image-turbo",
+        "source": "z-image",
+        "kind": "image",
+        "name": Z_IMAGE_MODEL_ID,
+        "port": "-",
+        "context": "-",
+        "size": None,
+        "ram": proc.get("rss"),
+        "vram": None,
+        "pid": proc.get("pid"),
+        "status": "running",
+    }]
+
+
 def _looks_like_voxcpm_process(proc):
     cmd = (proc.get("cmd") or "").lower()
     return (
@@ -1263,6 +1301,7 @@ def _external_rows(processes=None, fast=False):
     return (_discover_ollama(processes) + _discover_whisper(processes)
             + _discover_kokoro(processes, fast=fast)
             + _discover_bonsai_image(processes, fast=fast)
+            + _discover_z_image(processes, fast=fast)
             + _discover_voxcpm(processes, fast=fast))
 
 
@@ -1302,21 +1341,67 @@ def _compute_ncmoe(cfg, ctx, quiet=False):
                   file=sys.stderr)
         return None
     total   = int(auto.get("total_layers", 40))
-    per     = float(auto.get("per_layer_expert_mb", 310))
+    per_cfg = auto.get("per_layer_expert_mb", 310)
     base    = float(auto.get("base_gpu_mb", 900))
     compute = float(auto.get("compute_buffer_mb", 800))
     rs      = float(auto.get("rs_buffer_mb", 63))
-    kv128   = float(auto.get("kv_mb_at_128k", 500))
+    kv128   = float(auto.get("kv_mb_at_128k", auto.get("kv_cache_mb", 500)))
     safety  = float(auto.get("safety_margin_mb", 1024))
 
     kv = (ctx / 131072.0) * kv128
     budget = free_mb - kv - rs - compute - base - safety
-    layers_on_gpu = max(0, min(total, int(budget // per)))
-    ncmoe = total - layers_on_gpu
+
+    if isinstance(per_cfg, list):
+        layer_mb = [float(v) for v in per_cfg]
+        if len(layer_mb) < total:
+            layer_mb.extend([layer_mb[-1] if layer_mb else 310.0] * (total - len(layer_mb)))
+        layers_on_gpu = 0
+        used = 0.0
+        for value in reversed(layer_mb[:total]):
+            if used + value > budget:
+                break
+            used += value
+            layers_on_gpu += 1
+        ncmoe = total - layers_on_gpu
+    else:
+        per = float(per_cfg)
+        layers_on_gpu = max(0, min(total, int(budget // per)))
+        ncmoe = total - layers_on_gpu
+
     if not quiet:
         print(f"  auto-ncmoe: {free_mb} MiB free, ctx={ctx} -> "
               f"{layers_on_gpu}/{total} expert layers on GPU, ncmoe={ncmoe}")
     return ncmoe
+
+
+def _is_diffusion_runner(cfg):
+    runner = str(cfg.get("runner", "")).lower()
+    binary = str(cfg.get("binary", "")).lower()
+    return bool(cfg.get("diffusion")) or runner == "llama-diffusion-cli" or "llama-diffusion-cli" in binary
+
+
+def _diffusion_launcher_cmd(cfg, ctx):
+    launcher = cfg.get("launcher")
+    if not launcher:
+        return None
+    if not os.path.isfile(launcher):
+        print(f"Diffusion launcher not found: {launcher}", file=sys.stderr)
+        sys.exit(1)
+    cmd = [
+        "powershell",
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        launcher,
+        "-Context",
+        str(ctx),
+        "-Port",
+        str(cfg.get("port", 0)),
+        "-Threads",
+        str(cfg.get("threads", 8)),
+    ]
+    return cmd
 
 
 def _server_host(cfg, args=None):
@@ -1445,6 +1530,15 @@ def cmd_list(args):
         else:
             ctx_str = str(ctx)
 
+        if _is_inactive(cfg):
+            model_path = resolve_model_path(cfg)
+            size = os.path.getsize(model_path) if model_path and os.path.isfile(model_path) else None
+            status = "\033[90minactive\033[0m"
+            rows.append([key, "local-model", "llm", cfg.get("name", "?"),
+                         str(port), ctx_str, _fmt_bytes(size), "-", "-",
+                         status])
+            continue
+
         if _is_remote(cfg):
             reachable = _check_endpoint(cfg)
             if connected.get("key") == key and reachable:
@@ -1519,6 +1613,14 @@ def cmd_start(args):
     key = get_model_key(registry, args.model)
     cfg = get_model(registry, args.model)
 
+    if _is_inactive(cfg):
+        print(f"{cfg.get('name', key)} is marked inactive.", file=sys.stderr)
+        if cfg.get("notes"):
+            print(f"  notes: {cfg['notes']}", file=sys.stderr)
+        print("  Re-enable it with: local-model edit "
+              f"{key} --set active=true", file=sys.stderr)
+        sys.exit(1)
+
     if _is_remote(cfg):
         base = _model_endpoint(cfg)
         model_id = _remote_model_id(cfg, key)
@@ -1536,6 +1638,32 @@ def cmd_start(args):
             print("  (is the remote host serving the model, and is the network path up?)",
                   file=sys.stderr)
             sys.exit(1)
+        return
+
+    if _is_diffusion_runner(cfg):
+        model_path = resolve_model_path(cfg)
+        if not model_path:
+            print(f"Model file not found for '{key}'.", file=sys.stderr)
+            sys.exit(1)
+
+        ctx = args.ctx or cfg.get("context", 65536)
+        cmd = _diffusion_launcher_cmd(cfg, ctx)
+        if not cmd:
+            print("DiffusionGemma is not served by llama-server.", file=sys.stderr)
+            print("Add a launcher path to the registry, for example:", file=sys.stderr)
+            print(r"  ""launcher"": ""X:\Local-Model\run-diffusiongemma.ps1""", file=sys.stderr)
+            sys.exit(1)
+
+        print(f"Starting {cfg.get('name', key)} with llama-diffusion-cli...")
+        print(f"  context: {ctx}  port: {cfg.get('port', 0)} (registry/client hint)")
+        print("  note: DiffusionGemma runs in this terminal; it is not an OpenAI HTTP server yet.")
+        try:
+            result = subprocess.run(cmd)
+        except KeyboardInterrupt:
+            print("\nDiffusionGemma interrupted.")
+            return
+        if result.returncode:
+            sys.exit(result.returncode)
         return
 
     pid = get_running_pid(key)
@@ -1670,15 +1798,88 @@ def cmd_status(args):
         print("No models currently running.")
 
 
+def _registry_process_match_terms(key, cfg):
+    terms = [key]
+    for field in ("file", "binary", "launcher", "runner"):
+        value = cfg.get(field)
+        if not value:
+            continue
+        value = str(value)
+        if value.lower() in ("default", "auto", "on", "off"):
+            continue
+        terms.append(value)
+        name = Path(value).name
+        if name and name.lower() not in ("default", "auto", "on", "off"):
+            terms.append(name)
+    if cfg.get("name"):
+        terms.append(str(cfg.get("name")))
+    generic = {"default", "auto", "on", "off", "f16", "q4_k_m"}
+    return [t.lower() for t in terms if t and t.lower() not in generic]
+
+
+def _process_matches_registry_model(proc, key, cfg):
+    cmd = (proc.get("cmd") or "").lower()
+    name = (proc.get("name") or "").lower()
+    text = f"{name} {cmd}"
+    terms = _registry_process_match_terms(key, cfg)
+
+    model_file = str(cfg.get("file") or "").lower()
+    if model_file and (model_file in text or Path(model_file).name.lower() in text):
+        return True
+
+    binary = str(cfg.get("binary") or "").lower()
+    if binary and binary not in ("default", "auto", "on", "off") and (
+        binary in text or Path(binary).name.lower() in text
+    ):
+        return True
+
+    launcher = str(cfg.get("launcher") or "").lower()
+    if launcher and (launcher in text or Path(launcher).name.lower() in text):
+        return True
+
+    if _is_diffusion_runner(cfg) and "llama-diffusion-cli" in text:
+        return True
+
+    return any(term and len(term) >= 8 and term in text for term in terms)
+
+
+def _registry_model_process(key, cfg, processes):
+    candidates = [
+        p for p in processes.values()
+        if _process_matches_registry_model(p, key, cfg)
+    ]
+    if not candidates:
+        return None
+
+    # Prefer the actual model worker over the PowerShell wrapper when both are
+    # present. The worker owns the useful RAM/VRAM allocations.
+    def score(proc):
+        name = (proc.get("name") or "").lower()
+        cmd = (proc.get("cmd") or "").lower()
+        score_value = proc.get("rss") or 0
+        if "llama-diffusion-cli" in name or "llama-diffusion-cli" in cmd:
+            score_value += 10**15
+        if Path(str(cfg.get("file") or "")).name.lower() in cmd:
+            score_value += 10**14
+        return score_value
+
+    return max(candidates, key=score)
+
+
 def _monitor_items(registry, processes, gpu_per_pid):
     items = []
+    seen_pids = set()
     for key, cfg in sorted(registry.items()):
-        if _is_remote(cfg):
+        if _is_remote(cfg) or _is_inactive(cfg):
             continue
         pid = get_running_pid(key)
-        if not pid:
+        proc = processes.get(pid, {}) if pid else None
+        if not proc:
+            proc = _registry_model_process(key, cfg, processes)
+            pid = proc.get("pid") if proc else None
+        if not pid or not proc:
             continue
-        proc = processes.get(pid, {})
+        seen_pids.add(pid)
         items.append({
             "label": key,
             "source": "local-model",
@@ -1691,6 +1892,8 @@ def _monitor_items(registry, processes, gpu_per_pid):
         if row.get("status") not in ("running", "starting"):
             continue
         pid = row.get("pid")
+        if pid and pid in seen_pids:
+            continue
         items.append({
             "label": row["key"],
             "source": row["source"],
@@ -1703,6 +1906,61 @@ def _monitor_items(registry, processes, gpu_per_pid):
 
 
 _BAR_COLORS = ["31", "32", "33", "34", "35", "36", "91", "92", "93", "94", "95", "96"]
+_ANSI_RE = re.compile(r"\033\[[0-9;]*m")
+
+
+def _visible_len(text):
+    return len(_ANSI_RE.sub("", str(text)))
+
+
+def _ellipsize(text, width):
+    text = str(text)
+    if width <= 0:
+        return ""
+    if _visible_len(text) <= width:
+        return text
+    if width <= 3:
+        return text[:width]
+    return text[:width - 3] + "..."
+
+
+def _cell(text, width, align="<"):
+    text = _ellipsize(text, width)
+    pad = max(0, width - _visible_len(text))
+    if align == ">":
+        return (" " * pad) + text
+    return text + (" " * pad)
+
+
+def _monitor_table_widths(items, other_label):
+    color_w = len("Color")
+    pid_w = 7
+    ram_w = 10
+    vram_w = 10
+    source_pref = max(
+        len("Source"),
+        *(len(str(item.get("source", ""))) for item in items),
+        len("system"),
+    )
+    model_pref = max(
+        len("Model"),
+        *(len(str(item.get("label", ""))) for item in items),
+        len(other_label),
+    )
+
+    term_w = shutil.get_terminal_size((110, 20)).columns
+    spacing = 2 * 5
+    fixed = color_w + pid_w + ram_w + vram_w + spacing
+    available = max(38, term_w - fixed)
+
+    source_w = min(max(10, source_pref), 18)
+    model_w = min(model_pref, max(20, available - source_w))
+    if model_pref + source_w > available:
+        model_w = max(20, available - source_w)
+    if model_w + source_w > available:
+        source_w = max(8, available - model_w)
+
+    return color_w, model_w, source_w, pid_w, ram_w, vram_w
 
 
 def _render_bar(title, total, used, segments, width=54):
@@ -1776,20 +2034,43 @@ def _monitor_frame():
     lines.extend(_render_bar("RAM", ram_total, ram_used, ram_segments))
     lines.extend(_render_bar("VRAM", gpu_total, gpu_used, vram_segments))
     lines.append("")
-    lines.append(f"{'Color':<7} {'Model':<32} {'Source':<12} {'PID':>7} {'RAM':>10} {'VRAM':>10}")
-    lines.append("-" * 84)
+    other_label = "unattributed OS/process usage"
+    widths = _monitor_table_widths(items, other_label)
+    color_w, model_w, source_w, pid_w, ram_w, vram_w = widths
+
+    def table_row(color, model, source, pid, ram, vram):
+        cells = [
+            _cell(color, color_w),
+            _cell(model, model_w),
+            _cell(source, source_w),
+            _cell(pid, pid_w, ">"),
+            _cell(ram, ram_w, ">"),
+            _cell(vram, vram_w, ">"),
+        ]
+        return "  ".join(cells)
+
+    lines.append(table_row("Color", "Model", "Source", "PID", "RAM", "VRAM"))
+    lines.append("-" * _visible_len(lines[-1]))
     for item in items:
         color = color_by_label[item["label"]]
         swatch = f"\033[{color}m###\033[0m"
         pid = item.get("pid") or "-"
-        lines.append(
-            f"{swatch:<16} {item['label']:<32} {item['source']:<12} "
-            f"{str(pid):>7} {_fmt_bytes(item.get('ram')):>10} {_fmt_bytes(item.get('vram')):>10}"
+        lines.append(table_row(
+            swatch,
+            item["label"],
+            item["source"],
+            str(pid),
+            _fmt_bytes(item.get("ram")),
+            _fmt_bytes(item.get("vram")),
+        ))
+    lines.append(table_row(
+        "\033[90m###\033[0m",
+        other_label,
+        "system",
+        "-",
+        _fmt_bytes(other_ram),
+        _fmt_bytes(other_vram),
         )
-    swatch = "\033[90m###\033[0m"
-    lines.append(
-        f"{swatch:<16} {'unattributed OS/process usage':<32} {'system':<12} "
-        f"{'-':>7} {_fmt_bytes(other_ram):>10} {_fmt_bytes(other_vram):>10}"
     )
     return "\n".join(lines)
 
